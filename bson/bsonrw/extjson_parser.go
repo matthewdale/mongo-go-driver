@@ -9,6 +9,7 @@ package bsonrw
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -78,7 +79,7 @@ type extJSONParser struct {
 // malformed JSON at this point.
 func newExtJSONParser(r io.Reader, canonical bool) *extJSONParser {
 	return &extJSONParser{
-		js:        &jsonScanner{r: r},
+		js:        &jsonScanner{dec: json.NewDecoder(r)},
 		s:         jpsStartState,
 		m:         []jsonParseMode{},
 		canonical: canonical,

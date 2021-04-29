@@ -7,14 +7,12 @@
 package bsonrw
 
 import (
-	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"strconv"
-	"strings"
-	"unicode"
 )
 
 type jsonTokenType byte
@@ -42,398 +40,134 @@ type jsonToken struct {
 }
 
 type jsonScanner struct {
-	r           io.Reader
-	buf         []byte
-	pos         int
-	lastReadErr error
+	dec     *json.Decoder
+	delims  []json.Delim
+	isKey   bool
+	isColon bool
+	isComma bool
+}
+
+func push(stack []json.Delim, val json.Delim) []json.Delim {
+	return append(stack, val)
+}
+
+func pop(stack []json.Delim) ([]json.Delim, json.Delim) {
+	val := stack[len(stack)-1]
+	return stack[:len(stack)-1], val
+}
+
+func peek(stack []json.Delim) json.Delim {
+	return stack[len(stack)-1]
 }
 
 // nextToken returns the next JSON token if one exists. A token is a character
 // of the JSON grammar, a number, a string, or a literal.
 func (js *jsonScanner) nextToken() (*jsonToken, error) {
-	c, err := js.readNextByte()
-
-	// keep reading until a non-space is encountered (break on read error or EOF)
-	for isWhiteSpace(c) && err == nil {
-		c, err = js.readNextByte()
+	if js.delims == nil {
+		js.delims = make([]json.Delim, 0)
 	}
 
+	if js.isColon {
+		// fmt.Println("returning colon")
+		js.isColon = false
+		return &jsonToken{t: jttColon, v: byte(':')}, nil
+	}
+	if js.isComma {
+		// fmt.Println("returning comma")
+		js.isComma = false
+		return &jsonToken{t: jttComma, v: byte(',')}, nil
+	}
+
+	js.dec.UseNumber()
+	token, err := js.dec.Token()
 	if err == io.EOF {
 		return &jsonToken{t: jttEOF}, nil
-	} else if err != nil {
+	}
+	if err != nil {
 		return nil, err
 	}
 
-	// switch on the character
-	switch c {
-	case '{':
-		return &jsonToken{t: jttBeginObject, v: byte('{'), p: js.pos - 1}, nil
-	case '}':
-		return &jsonToken{t: jttEndObject, v: byte('}'), p: js.pos - 1}, nil
-	case '[':
-		return &jsonToken{t: jttBeginArray, v: byte('['), p: js.pos - 1}, nil
-	case ']':
-		return &jsonToken{t: jttEndArray, v: byte(']'), p: js.pos - 1}, nil
-	case ':':
-		return &jsonToken{t: jttColon, v: byte(':'), p: js.pos - 1}, nil
-	case ',':
-		return &jsonToken{t: jttComma, v: byte(','), p: js.pos - 1}, nil
-	case '"': // RFC-8259 only allows for double quotes (") not single (')
-		return js.scanString()
-	default:
-		// check if it's a number
-		if c == '-' || isDigit(c) {
-			return js.scanNumber(c)
-		} else if c == 't' || c == 'f' || c == 'n' {
-			// maybe a literal
-			return js.scanLiteral(c)
-		} else {
-			return nil, fmt.Errorf("invalid JSON input. Position: %d. Character: %c", js.pos-1, c)
-		}
-	}
-}
+	// fmt.Printf("token: %v", token)
+	// defer func() {
+	// 	fmt.Printf(
+	// 		"; state = delims: %v, isKey: %t, isColon: %t, isComma: %t\n",
+	// 		js.delims,
+	// 		js.isKey,
+	// 		js.isColon,
+	// 		js.isComma)
+	// }()
 
-// readNextByte attempts to read the next byte from the buffer. If the buffer
-// has been exhausted, this function calls readIntoBuf, thus refilling the
-// buffer and resetting the read position to 0
-func (js *jsonScanner) readNextByte() (byte, error) {
-	if js.pos >= len(js.buf) {
-		err := js.readIntoBuf()
-
-		if err != nil {
-			return 0, err
-		}
+	// If we're in a JSON object, flip-flop between key and value.
+	if len(js.delims) > 0 && peek(js.delims) == '{' {
+		js.isKey = !js.isKey
 	}
 
-	b := js.buf[js.pos]
-	js.pos++
-
-	return b, nil
-}
-
-// readNNextBytes reads n bytes into dst, starting at offset
-func (js *jsonScanner) readNNextBytes(dst []byte, n, offset int) error {
-	var err error
-
-	for i := 0; i < n; i++ {
-		dst[i+offset], err = js.readNextByte()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// readIntoBuf reads up to 512 bytes from the scanner's io.Reader into the buffer
-func (js *jsonScanner) readIntoBuf() error {
-	if js.lastReadErr != nil {
-		js.buf = js.buf[:0]
-		js.pos = 0
-		return js.lastReadErr
-	}
-
-	if cap(js.buf) == 0 {
-		js.buf = make([]byte, 0, 512)
-	}
-
-	n, err := js.r.Read(js.buf[:cap(js.buf)])
-	if err != nil {
-		js.lastReadErr = err
-		if n > 0 {
-			err = nil
-		}
-	}
-	js.buf = js.buf[:n]
-	js.pos = 0
-
-	return err
-}
-
-func isWhiteSpace(c byte) bool {
-	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
-}
-
-func isDigit(c byte) bool {
-	return unicode.IsDigit(rune(c))
-}
-
-func isValueTerminator(c byte) bool {
-	return c == ',' || c == '}' || c == ']' || isWhiteSpace(c)
-}
-
-// scanString reads from an opening '"' to a closing '"' and handles escaped characters
-func (js *jsonScanner) scanString() (*jsonToken, error) {
-	var b bytes.Buffer
-	var c byte
-	var err error
-
-	p := js.pos - 1
-
-	for {
-		c, err = js.readNextByte()
-		if err != nil {
-			if err == io.EOF {
-				return nil, errors.New("end of input in JSON string")
-			}
-			return nil, err
-		}
-
-		switch c {
-		case '\\':
-			c, err = js.readNextByte()
-			switch c {
-			case '"', '\\', '/':
-				b.WriteByte(c)
-			case 'b':
-				b.WriteByte('\b')
-			case 'f':
-				b.WriteByte('\f')
-			case 'n':
-				b.WriteByte('\n')
-			case 'r':
-				b.WriteByte('\r')
-			case 't':
-				b.WriteByte('\t')
-			case 'u':
-				us := make([]byte, 4)
-				err = js.readNNextBytes(us, 4, 0)
-				if err != nil {
-					return nil, fmt.Errorf("invalid unicode sequence in JSON string: %s", us)
-				}
-
-				s := fmt.Sprintf(`\u%s`, us)
-				s, err = strconv.Unquote(strings.Replace(strconv.Quote(s), `\\u`, `\u`, 1))
-				if err != nil {
-					return nil, err
-				}
-
-				b.WriteString(s)
-			default:
-				return nil, fmt.Errorf("invalid escape sequence in JSON string '\\%c'", c)
-			}
-		case '"':
-			return &jsonToken{t: jttString, v: b.String(), p: p}, nil
+	if js.isKey {
+		switch token.(type) {
+		case string:
+			js.isColon = true
+		case json.Delim:
+			js.isKey = false
 		default:
-			b.WriteByte(c)
-		}
-	}
-}
-
-// scanLiteral reads an unquoted sequence of characters and determines if it is one of
-// three valid JSON literals (true, false, null); if so, it returns the appropriate
-// jsonToken; otherwise, it returns an error
-func (js *jsonScanner) scanLiteral(first byte) (*jsonToken, error) {
-	p := js.pos - 1
-
-	lit := make([]byte, 4)
-	lit[0] = first
-
-	err := js.readNNextBytes(lit, 3, 1)
-	if err != nil {
-		return nil, err
-	}
-
-	c5, err := js.readNextByte()
-
-	if bytes.Equal([]byte("true"), lit) && (isValueTerminator(c5) || err == io.EOF) {
-		js.pos = int(math.Max(0, float64(js.pos-1)))
-		return &jsonToken{t: jttBool, v: true, p: p}, nil
-	} else if bytes.Equal([]byte("null"), lit) && (isValueTerminator(c5) || err == io.EOF) {
-		js.pos = int(math.Max(0, float64(js.pos-1)))
-		return &jsonToken{t: jttNull, v: nil, p: p}, nil
-	} else if bytes.Equal([]byte("fals"), lit) {
-		if c5 == 'e' {
-			c5, err = js.readNextByte()
-
-			if isValueTerminator(c5) || err == io.EOF {
-				js.pos = int(math.Max(0, float64(js.pos-1)))
-				return &jsonToken{t: jttBool, v: false, p: p}, nil
-			}
+			return nil, fmt.Errorf("object keys must be strings, got %T (%q)", token, token)
 		}
 	}
 
-	return nil, fmt.Errorf("invalid JSON literal. Position: %d, literal: %s", p, lit)
-}
+	more := js.dec.More()
+	js.isComma = more && len(js.delims) > 0 &&
+		((peek(js.delims) == '{' && !js.isKey) ||
+			(peek(js.delims) == '['))
 
-type numberScanState byte
-
-const (
-	nssSawLeadingMinus numberScanState = iota
-	nssSawLeadingZero
-	nssSawIntegerDigits
-	nssSawDecimalPoint
-	nssSawFractionDigits
-	nssSawExponentLetter
-	nssSawExponentSign
-	nssSawExponentDigits
-	nssDone
-	nssInvalid
-)
-
-// scanNumber reads a JSON number (according to RFC-8259)
-func (js *jsonScanner) scanNumber(first byte) (*jsonToken, error) {
-	var b bytes.Buffer
-	var s numberScanState
-	var c byte
-	var err error
-
-	t := jttInt64 // assume it's an int64 until the type can be determined
-	start := js.pos - 1
-
-	b.WriteByte(first)
-
-	switch first {
-	case '-':
-		s = nssSawLeadingMinus
-	case '0':
-		s = nssSawLeadingZero
-	default:
-		s = nssSawIntegerDigits
+	if token == nil {
+		return &jsonToken{t: jttNull}, nil
 	}
 
-	for {
-		c, err = js.readNextByte()
-
-		if err != nil && err != io.EOF {
-			return nil, err
+	// TODO: How do we set "p" position? Maybe just say "after last token %s"? Seems to only be used for errors.
+	switch val := token.(type) {
+	case json.Delim:
+		var t jsonTokenType
+		switch val {
+		case '{':
+			js.isKey = false
+			js.isComma = false
+			js.delims = push(js.delims, val)
+			t = jttBeginObject
+		case '}':
+			js.delims, _ = pop(js.delims)
+			t = jttEndObject
+		case '[':
+			js.isKey = false
+			js.isComma = false
+			js.delims = push(js.delims, val)
+			t = jttBeginArray
+		case ']':
+			js.delims, _ = pop(js.delims)
+			t = jttEndArray
 		}
 
-		switch s {
-		case nssSawLeadingMinus:
-			switch c {
-			case '0':
-				s = nssSawLeadingZero
-				b.WriteByte(c)
-			default:
-				if isDigit(c) {
-					s = nssSawIntegerDigits
-					b.WriteByte(c)
-				} else {
-					s = nssInvalid
-				}
+		return &jsonToken{t: t, v: byte(val)}, nil
+	case bool:
+		return &jsonToken{t: jttBool, v: val}, nil
+	case float64:
+		return nil, fmt.Errorf("unreachable state float64, expected json.Number for value %f", val)
+	case json.Number:
+		if int64Val, err := strconv.ParseInt(string(val), 10, 64); err == nil {
+			if int64Val < math.MinInt32 || int64Val > math.MaxInt32 {
+				return &jsonToken{t: jttInt64, v: int64Val}, nil
 			}
-		case nssSawLeadingZero:
-			switch c {
-			case '.':
-				s = nssSawDecimalPoint
-				b.WriteByte(c)
-			case 'e', 'E':
-				s = nssSawExponentLetter
-				b.WriteByte(c)
-			case '}', ']', ',':
-				s = nssDone
-			default:
-				if isWhiteSpace(c) || err == io.EOF {
-					s = nssDone
-				} else {
-					s = nssInvalid
-				}
-			}
-		case nssSawIntegerDigits:
-			switch c {
-			case '.':
-				s = nssSawDecimalPoint
-				b.WriteByte(c)
-			case 'e', 'E':
-				s = nssSawExponentLetter
-				b.WriteByte(c)
-			case '}', ']', ',':
-				s = nssDone
-			default:
-				if isWhiteSpace(c) || err == io.EOF {
-					s = nssDone
-				} else if isDigit(c) {
-					s = nssSawIntegerDigits
-					b.WriteByte(c)
-				} else {
-					s = nssInvalid
-				}
-			}
-		case nssSawDecimalPoint:
-			t = jttDouble
-			if isDigit(c) {
-				s = nssSawFractionDigits
-				b.WriteByte(c)
-			} else {
-				s = nssInvalid
-			}
-		case nssSawFractionDigits:
-			switch c {
-			case 'e', 'E':
-				s = nssSawExponentLetter
-				b.WriteByte(c)
-			case '}', ']', ',':
-				s = nssDone
-			default:
-				if isWhiteSpace(c) || err == io.EOF {
-					s = nssDone
-				} else if isDigit(c) {
-					s = nssSawFractionDigits
-					b.WriteByte(c)
-				} else {
-					s = nssInvalid
-				}
-			}
-		case nssSawExponentLetter:
-			t = jttDouble
-			switch c {
-			case '+', '-':
-				s = nssSawExponentSign
-				b.WriteByte(c)
-			default:
-				if isDigit(c) {
-					s = nssSawExponentDigits
-					b.WriteByte(c)
-				} else {
-					s = nssInvalid
-				}
-			}
-		case nssSawExponentSign:
-			if isDigit(c) {
-				s = nssSawExponentDigits
-				b.WriteByte(c)
-			} else {
-				s = nssInvalid
-			}
-		case nssSawExponentDigits:
-			switch c {
-			case '}', ']', ',':
-				s = nssDone
-			default:
-				if isWhiteSpace(c) || err == io.EOF {
-					s = nssDone
-				} else if isDigit(c) {
-					s = nssSawExponentDigits
-					b.WriteByte(c)
-				} else {
-					s = nssInvalid
-				}
-			}
+
+			int32Val := int32(int64Val)
+			return &jsonToken{t: jttInt32, v: int32Val}, nil
 		}
 
-		switch s {
-		case nssInvalid:
-			return nil, fmt.Errorf("invalid JSON number. Position: %d", start)
-		case nssDone:
-			js.pos = int(math.Max(0, float64(js.pos-1)))
-			if t != jttDouble {
-				v, err := strconv.ParseInt(b.String(), 10, 64)
-				if err == nil {
-					if v < math.MinInt32 || v > math.MaxInt32 {
-						return &jsonToken{t: jttInt64, v: v, p: start}, nil
-					}
-
-					return &jsonToken{t: jttInt32, v: int32(v), p: start}, nil
-				}
-			}
-
-			v, err := strconv.ParseFloat(b.String(), 64)
-			if err != nil {
-				return nil, err
-			}
-
-			return &jsonToken{t: jttDouble, v: v, p: start}, nil
+		if floatVal, err := strconv.ParseFloat(string(val), 64); err == nil {
+			return &jsonToken{t: jttDouble, v: floatVal}, nil
 		}
+
+		return nil, fmt.Errorf("error parsing json.Number %q", val)
+	case string:
+		return &jsonToken{t: jttString, v: val}, nil
 	}
+
+	return nil, errors.New("invalid JSON input")
 }
