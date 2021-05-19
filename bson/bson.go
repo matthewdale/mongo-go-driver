@@ -22,6 +22,37 @@ type Zeroer interface {
 	IsZero() bool
 }
 
+type D2 [][2]interface{}
+
+func (d2 D2) ToD() D {
+	return D{}
+}
+
+func E2(key string, value interface{}) E {
+	return E{Key: key, Value: value}
+}
+
+func D3() *dbuilder {
+	return &dbuilder{}
+}
+
+type dbuilder struct {
+	D
+}
+
+func (db *dbuilder) E(key string, value interface{}) *dbuilder {
+	db.D = append(db.D, E{Key: key, Value: value})
+	return db
+}
+
+func (db *dbuilder) ToD() D {
+	return D{}
+}
+
+func D4(elements ...E) D {
+	return elements
+}
+
 // D is an ordered representation of a BSON document. This type should be used when the order of the elements matters,
 // such as MongoDB command documents. If the order of the elements does not matter, an M should be used instead.
 //
