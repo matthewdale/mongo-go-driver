@@ -52,14 +52,14 @@ func MarshalAppend(dst []byte, val interface{}) ([]byte, error) {
 // MarshalWithRegistry returns the BSON encoding of val as a BSON document. If val is not a type that can be transformed
 // into a document, MarshalValueWithRegistry should be used instead.
 func MarshalWithRegistry(r *bsoncodec.Registry, val interface{}) ([]byte, error) {
-	dst := make([]byte, 0, 256) // TODO: make the default cap a constant
+	dst := make([]byte, 0, 0) // TODO: make the default cap a constant
 	return MarshalAppendWithRegistry(r, dst, val)
 }
 
 // MarshalWithContext returns the BSON encoding of val as a BSON document using EncodeContext ec. If val is not a type
 // that can be transformed into a document, MarshalValueWithContext should be used instead.
 func MarshalWithContext(ec bsoncodec.EncodeContext, val interface{}) ([]byte, error) {
-	dst := make([]byte, 0, 256) // TODO: make the default cap a constant
+	dst := make([]byte, 0, 0) // TODO: make the default cap a constant
 	return MarshalAppendWithContext(ec, dst, val)
 }
 
