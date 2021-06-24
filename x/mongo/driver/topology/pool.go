@@ -73,6 +73,10 @@ type pool struct {
 	opened map[uint64]*connection // opened holds all of the currently open connections.
 	sem    *semaphore.Weighted
 	sync.Mutex
+
+	connCh        chan *connection
+	waitingCh     chan struct{}
+	connectingSem *semaphore.Weighted
 }
 
 // connectionExpiredFunc checks if a given connection is stale and should be removed from the resource pool
@@ -160,6 +164,10 @@ func newPool(config poolConfig, connOpts ...ConnectionOption) (*pool, error) {
 		opts:       opts,
 		sem:        semaphore.NewWeighted(int64(maxConns)),
 		generation: newPoolGenerationMap(),
+		connCh:     make(chan *connection),
+		waitingCh:  make(chan struct{}),
+		// TODO: What value should this be?
+		connectingSem: semaphore.NewWeighted(2),
 	}
 	pool.opts = append(pool.opts, withGenerationNumberFn(func(_ generationNumberFn) generationNumberFn { return pool.getGenerationForNewConnection }))
 
@@ -335,7 +343,109 @@ func (p *pool) unpinConnectionFromTransaction() {
 	atomic.AddUint64(&p.pinnedTransactionConnections, ^uint64(0))
 }
 
-// Checkout returns a connection from the pool
+func (p *pool) makeConns() {
+	// TODO: What
+	for range p.waitingCh {
+
+		// TODO: How long should we wait here to prevent the loop from becoming a busy wait?
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := p.connectingSem.Acquire(ctx, 1); err != nil {
+			cancel()
+			continue
+		}
+		cancel()
+
+		// TODO: How do we limit the number of these running?
+		go func() {
+			defer p.connectingSem.Release(1)
+			// TODO: Do we need any of this?
+			// err := p.sem.Acquire(ctx, 1)
+			// if err != nil {
+			// 	if p.monitor != nil {
+			// 		p.monitor.Event(&event.PoolEvent{
+			// 			Type:    event.GetFailed,
+			// 			Address: p.address.String(),
+			// 			Reason:  event.ReasonTimedOut,
+			// 		})
+			// 	}
+			// 	errWaitQueueTimeout := WaitQueueTimeoutError{
+			// 		Wrapped:                      ctx.Err(),
+			// 		PinnedCursorConnections:      atomic.LoadUint64(&p.pinnedCursorConnections),
+			// 		PinnedTransactionConnections: atomic.LoadUint64(&p.pinnedTransactionConnections),
+			// 		maxPoolSize:                  p.conns.maxSize,
+			// 	}
+			// 	return nil, errWaitQueueTimeout
+			// }
+
+			// If incrementTotal fails, we've reached the maximum pool size so we can't create any
+			// more connections.
+			// TODO: Is this what we should do here?
+			// made := p.conns.incrementTotal()
+			// if !made {
+			// 	return
+			// }
+
+			// TODO: How long should we wait here?
+			// TODO: Should we try to acquire with a timeout or fail immediately?
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			err := p.sem.Acquire(ctx, 1)
+			if err != nil {
+				// TODO: Huh?
+				return
+			}
+			// if !p.sem.TryAcquire(1) {
+			// 	return
+			// }
+
+			c, reason, err := p.makeNewConnection()
+
+			if err != nil {
+				if p.monitor != nil {
+					// We only publish a GetFailed event because makeNewConnection has already published
+					// ConnectionClosed if needed.
+					// TODO: What event types should we send here? Does anything correspond directly
+					// to background connection failure?
+					p.monitor.Event(&event.PoolEvent{
+						Type:    event.GetFailed,
+						Address: p.address.String(),
+						Reason:  reason,
+					})
+				}
+				// p.conns.decrementTotal()
+				p.sem.Release(1)
+
+				// return nil, err
+				return
+			}
+
+			c.connect(context.Background())
+			// wait for conn to be connected
+			err = c.wait()
+			if err != nil {
+				// Call removeConnection to remove the connection reference and fire a ConnectionClosedEvent.
+				_ = p.removeConnection(c, event.ReasonConnectionErrored)
+				// p.conns.decrementTotal()
+				p.sem.Release(1)
+
+				if p.monitor != nil {
+					p.monitor.Event(&event.PoolEvent{
+						Type:    event.GetFailed,
+						Address: p.address.String(),
+						Reason:  event.ReasonConnectionErrored,
+					})
+				}
+
+				return
+			}
+
+			p.put(c)
+		}()
+	}
+}
+
+// get returns a connection from the pool
 func (p *pool) get(ctx context.Context) (*connection, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -352,8 +462,42 @@ func (p *pool) get(ctx context.Context) (*connection, error) {
 		return nil, ErrPoolDisconnected
 	}
 
-	err := p.sem.Acquire(ctx, 1)
-	if err != nil {
+	connVal := p.conns.Get()
+	if c, ok := connVal.(*connection); ok && connVal != nil {
+		// call connect if not connected
+		if atomic.LoadInt32(&c.connected) == initialized {
+			c.connect(ctx)
+		}
+
+		err := c.wait()
+		if err != nil {
+			// Call removeConnection to remove the connection reference and emit a ConnectionClosed event.
+			_ = p.removeConnection(c, event.ReasonConnectionErrored)
+			// p.conns.decrementTotal()
+			p.sem.Release(1)
+
+			if p.monitor != nil {
+				p.monitor.Event(&event.PoolEvent{
+					Type:    event.GetFailed,
+					Address: p.address.String(),
+					Reason:  event.ReasonConnectionErrored,
+				})
+			}
+			return nil, err
+		}
+
+		if p.monitor != nil {
+			p.monitor.Event(&event.PoolEvent{
+				Type:         event.GetSucceeded,
+				Address:      p.address.String(),
+				ConnectionID: c.poolID,
+			})
+		}
+		return c, nil
+	}
+
+	select {
+	case <-ctx.Done():
 		if p.monitor != nil {
 			p.monitor.Event(&event.PoolEvent{
 				Type:    event.GetFailed,
@@ -361,127 +505,24 @@ func (p *pool) get(ctx context.Context) (*connection, error) {
 				Reason:  event.ReasonTimedOut,
 			})
 		}
-		errWaitQueueTimeout := WaitQueueTimeoutError{
-			Wrapped:                      ctx.Err(),
-			PinnedCursorConnections:      atomic.LoadUint64(&p.pinnedCursorConnections),
-			PinnedTransactionConnections: atomic.LoadUint64(&p.pinnedTransactionConnections),
-			maxPoolSize:                  p.conns.maxSize,
-		}
-		return nil, errWaitQueueTimeout
+		return nil, ctx.Err()
+	default:
 	}
 
-	// This loop is so that we don't end up with more than maxPoolSize connections if p.conns.Maintain runs between
-	// calling p.conns.Get() and making the new connection
-	for {
-		if atomic.LoadInt32(&p.connected) != connected {
-			if p.monitor != nil {
-				p.monitor.Event(&event.PoolEvent{
-					Type:    event.GetFailed,
-					Address: p.address.String(),
-					Reason:  event.ReasonPoolClosed,
-				})
-			}
-			p.sem.Release(1)
-			return nil, ErrPoolDisconnected
+	// TODO: Signal that we need a new conn.
+
+	select {
+	case <-ctx.Done():
+		if p.monitor != nil {
+			p.monitor.Event(&event.PoolEvent{
+				Type:    event.GetFailed,
+				Address: p.address.String(),
+				Reason:  event.ReasonTimedOut,
+			})
 		}
-
-		connVal := p.conns.Get()
-		if c, ok := connVal.(*connection); ok && connVal != nil {
-			// call connect if not connected
-			if atomic.LoadInt32(&c.connected) == initialized {
-				c.connect(ctx)
-			}
-
-			err := c.wait()
-			if err != nil {
-				// Call removeConnection to remove the connection reference and emit a ConnectionClosed event.
-				_ = p.removeConnection(c, event.ReasonConnectionErrored)
-				p.conns.decrementTotal()
-				p.sem.Release(1)
-
-				if p.monitor != nil {
-					p.monitor.Event(&event.PoolEvent{
-						Type:    event.GetFailed,
-						Address: p.address.String(),
-						Reason:  event.ReasonConnectionErrored,
-					})
-				}
-				return nil, err
-			}
-
-			if p.monitor != nil {
-				p.monitor.Event(&event.PoolEvent{
-					Type:         event.GetSucceeded,
-					Address:      p.address.String(),
-					ConnectionID: c.poolID,
-				})
-			}
-			return c, nil
-		}
-
-		select {
-		case <-ctx.Done():
-			if p.monitor != nil {
-				p.monitor.Event(&event.PoolEvent{
-					Type:    event.GetFailed,
-					Address: p.address.String(),
-					Reason:  event.ReasonTimedOut,
-				})
-			}
-			p.sem.Release(1)
-			return nil, ctx.Err()
-		default:
-			// The pool is empty, so we try to make a new connection. If incrementTotal fails, the resource pool has
-			// more resources than we previously thought, so we try to get a resource again.
-			made := p.conns.incrementTotal()
-			if !made {
-				continue
-			}
-			c, reason, err := p.makeNewConnection()
-
-			if err != nil {
-				if p.monitor != nil {
-					// We only publish a GetFailed event because makeNewConnection has already published
-					// ConnectionClosed if needed.
-					p.monitor.Event(&event.PoolEvent{
-						Type:    event.GetFailed,
-						Address: p.address.String(),
-						Reason:  reason,
-					})
-				}
-				p.conns.decrementTotal()
-				p.sem.Release(1)
-				return nil, err
-			}
-
-			c.connect(ctx)
-			// wait for conn to be connected
-			err = c.wait()
-			if err != nil {
-				// Call removeConnection to remove the connection reference and fire a ConnectionClosedEvent.
-				_ = p.removeConnection(c, event.ReasonConnectionErrored)
-				p.conns.decrementTotal()
-				p.sem.Release(1)
-
-				if p.monitor != nil {
-					p.monitor.Event(&event.PoolEvent{
-						Type:    event.GetFailed,
-						Address: p.address.String(),
-						Reason:  event.ReasonConnectionErrored,
-					})
-				}
-				return nil, err
-			}
-
-			if p.monitor != nil {
-				p.monitor.Event(&event.PoolEvent{
-					Type:         event.GetSucceeded,
-					Address:      p.address.String(),
-					ConnectionID: c.poolID,
-				})
-			}
-			return c, nil
-		}
+		return nil, ctx.Err()
+	case conn := <-p.connCh:
+		return conn, nil
 	}
 }
 
@@ -550,7 +591,6 @@ func (p *pool) removeConnection(c *connection, reason string) error {
 // stale, and there is space in the cache, the connection is returned to the cache. This
 // assumes that the connection has already been counted in p.conns.totalSize.
 func (p *pool) put(c *connection) error {
-	defer p.sem.Release(1)
 	if p.monitor != nil {
 		var cid uint64
 		var addr string
@@ -571,6 +611,14 @@ func (p *pool) put(c *connection) error {
 
 	if c.pool != p {
 		return ErrWrongPool
+	}
+
+	// If another get() is waiting for a connection on the connections channel, send it to the first
+	// waiting get(). Otherwise, return it to the resourcePool.
+	select {
+	case p.connCh <- c:
+		return nil
+	default:
 	}
 
 	_ = p.conns.Put(c)
