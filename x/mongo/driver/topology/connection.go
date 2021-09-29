@@ -53,7 +53,6 @@ type connection struct {
 	writeTimeout         time.Duration
 	descMu               sync.RWMutex // Guards desc. TODO: Remove with or after GODRIVER-2038.
 	desc                 description.Server
-	helloRTT             time.Duration
 	compressor           wiremessage.CompressorID
 	zliblevel            int
 	zstdLevel            int
@@ -228,7 +227,6 @@ func (c *connection) connect(ctx context.Context) {
 	}
 
 	var handshakeInfo driver.HandshakeInformation
-	handshakeStartTime := time.Now()
 	handshakeConn := initConnection{c}
 	handshakeInfo, err = handshaker.GetHandshakeInformation(handshakeCtx, c.addr, handshakeConn)
 	if err == nil {
@@ -239,7 +237,6 @@ func (c *connection) connect(ctx context.Context) {
 		c.desc = handshakeInfo.Description
 		c.descMu.Unlock()
 		c.serverConnectionID = handshakeInfo.ServerConnectionID
-		c.helloRTT = time.Since(handshakeStartTime)
 
 		// If the application has indicated that the cluster is load balanced, ensure the server has included serviceId
 		// in its handshake response to signal that it knows it's behind an LB as well.
