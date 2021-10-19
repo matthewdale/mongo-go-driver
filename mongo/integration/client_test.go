@@ -468,6 +468,101 @@ func TestClient(t *testing.T) {
 		err := mt.Client.Ping(context.Background(), readpref.Primary())
 		assert.Nil(t, err, "unexpected error calling Ping: %v", err)
 	})
+
+	mtOpts = mtest.NewOptions().MinServerVersion("4.0")
+	mt.RunOpts("minimum RTT is monitored", mtOpts, func(mt *mtest.T) {
+		// Force hello requests to block for 500ms, reset the test client to zero the minimum RTT,
+		// and wait until a server's minimum RTT goes over 250ms.
+		mt.SetFailPoint(mtest.FailPoint{
+			ConfigureFailPoint: "failCommand",
+			Mode: mtest.FailPointMode{
+				Times: 1000,
+			},
+			Data: mtest.FailPointData{
+				FailCommands:    []string{internal.LegacyHello, "hello"},
+				BlockConnection: true,
+				BlockTimeMS:     500,
+				AppName:         "clientMinRTTTest",
+			},
+		})
+		// Reset the client after setting the fail point to reset the RTT monitor samples and apply
+		// the app name.
+		mt.ResetClient(options.Client().
+			SetHeartbeatInterval(100 * time.Millisecond).
+			SetAppName("clientMinRTTTest"))
+
+		topo := getTopologyFromClient(mt.Client)
+		assert.Soon(mt, func() {
+			for {
+				// We don't know which server received the failpoint command, so we wait until any
+				// of the server minimum RTTs cross the threshold.
+				for _, desc := range topo.Description().Servers {
+					server, err := topo.FindServer(desc)
+					assert.Nil(mt, err, "unexpected error calling t.FindServer(): %v", err)
+					if server.MinRTT() > 250*time.Millisecond {
+						return
+					}
+				}
+
+				time.Sleep(100 * time.Millisecond)
+			}
+		}, 10*time.Second)
+	})
+
+	mtOpts = mtest.NewOptions().
+		MinServerVersion("4.0").
+		Topologies(mtest.Single)
+	mt.RunOpts("minimum RTT used to cancel requests", mtOpts, func(mt *mtest.T) {
+		// Force hello requests to block for 500ms, reset the test client to zero the minimum RTT,
+		// and wait until a server's minimum RTT goes over 250ms.
+		mt.SetFailPoint(mtest.FailPoint{
+			ConfigureFailPoint: "failCommand",
+			Mode: mtest.FailPointMode{
+				Times: 1000,
+			},
+			Data: mtest.FailPointData{
+				FailCommands:    []string{internal.LegacyHello, "hello"},
+				BlockConnection: true,
+				BlockTimeMS:     500,
+				AppName:         "clientMinRTTPingTest",
+			},
+		})
+
+		// Assert that we can call Ping with a 250ms timeout after the failpoint is set but before
+		// resetting the client. The "hello" latency shouldn't affect operations yet because the
+		// server's minimum RTT is still <250ms.
+		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		defer cancel()
+		err := mt.Client.Ping(ctx, nil)
+		assert.Nil(mt, err, "unexpected error calling Ping")
+
+		// Reset the client after setting the fail point to reset the RTT monitor samples and apply
+		// the app name.
+		mt.ResetClient(options.Client().
+			SetHeartbeatInterval(100 * time.Millisecond).
+			SetAppName("clientMinRTTPingTest"))
+
+		// Assert that the minimum RTT is over 250ms.
+		topo := getTopologyFromClient(mt.Client)
+		assert.Soon(mt, func() {
+			for {
+				// We can only run this test in single server mode because
+				desc := topo.Description().Servers[0]
+				server, err := topo.FindServer(desc)
+				assert.Nil(mt, err, "unexpected error calling t.FindServer(): %v", err)
+				if server.MinRTT() > 250*time.Millisecond {
+					return
+				}
+
+				time.Sleep(100 * time.Millisecond)
+			}
+		}, 10*time.Second)
+
+		ctx, cancel = context.WithTimeout(context.Background(), 250*time.Millisecond)
+		defer cancel()
+		err = mt.Client.Ping(ctx, nil)
+		assert.NotNil(mt, err, "expected Ping to return an error")
+	})
 }
 
 type proxyMessage struct {
