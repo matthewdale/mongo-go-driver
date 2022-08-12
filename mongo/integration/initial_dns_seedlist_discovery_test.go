@@ -8,17 +8,22 @@ package integration
 
 import (
 	"context"
+	"crypto/tls"
 	"io/ioutil"
 	"os"
 	"path"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/internal/testutil/assert"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/description"
 	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
 )
@@ -35,6 +40,7 @@ type seedlistTest struct {
 	NumHosts *int     `bson:"numHosts"`
 	Error    bool     `bson:"error"`
 	Options  bson.Raw `bson:"options"`
+	Ping     bool     `bson:"ping"`
 }
 
 func TestInitialDNSSeedlistDiscoverySpec(t *testing.T) {
@@ -118,6 +124,28 @@ func runSeedlistDiscoveryTest(mt *mtest.T, file string) {
 		_, err := getServerByAddress(host, topo)
 		assert.Nil(mt, err, "error finding host %q: %v", host, err)
 	}
+
+	if !test.Ping {
+		return
+	}
+
+	// If the test requests that we try to run a "ping", connect a new client with the test URI and
+	// assert that a "ping" runs successfully. Note that this test runs against MongoDB deployments
+	// with auth enabled, but the test URIs do not include auth information. The "ping" should still
+	// succeed because the "ping" operation does not require authentication to run.
+	opts := options.Client().ApplyURI(test.URI)
+	// TODO: Comment?
+	if os.Getenv("SSL") == "ssl" {
+		opts = opts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	}
+	client, err := mongo.Connect(context.Background(), opts)
+	assert.Nil(mt, err, "Connect error: %v", err)
+	defer client.Disconnect(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = client.Ping(ctx, readpref.Nearest())
+	assert.Nil(mt, err, "Ping error: %v", err)
 }
 
 func buildSet(list []string) map[string]struct{} {
