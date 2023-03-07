@@ -89,6 +89,7 @@ const (
 	GetFailed          = "ConnectionCheckOutFailed"
 	GetSucceeded       = "ConnectionCheckedOut"
 	ConnectionReturned = "ConnectionCheckedIn"
+	NewEvent           = "NewEvent"
 )
 
 // MonitorPoolOptions contains pool options as formatted in pool events
