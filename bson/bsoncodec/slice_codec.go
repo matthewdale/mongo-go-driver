@@ -48,10 +48,8 @@ func (sc SliceCodec) EncodeValue(ec EncodeContext, vw bsonrw.ValueWriter, val re
 
 	// If we have a []byte we want to treat it as a binary instead of as an array.
 	if val.Type().Elem() == tByte {
-		var byteSlice []byte
-		for idx := 0; idx < val.Len(); idx++ {
-			byteSlice = append(byteSlice, val.Index(idx).Interface().(byte))
-		}
+		byteSlice := make([]byte, val.Len())
+		copy(byteSlice, val.Interface().([]byte))
 		return vw.WriteBinary(byteSlice)
 	}
 
@@ -112,7 +110,6 @@ func (sc SliceCodec) EncodeValue(ec EncodeContext, vw bsonrw.ValueWriter, val re
 	return aw.WriteArrayEnd()
 }
 
-// DecodeValue is the ValueDecoder for slice types.
 func (sc *SliceCodec) DecodeValue(dc DecodeContext, vr bsonrw.ValueReader, val reflect.Value) error {
 	if !val.CanSet() || val.Kind() != reflect.Slice {
 		return ValueDecoderError{Name: "SliceDecodeValue", Kinds: []reflect.Kind{reflect.Slice}, Received: val}
@@ -145,11 +142,8 @@ func (sc *SliceCodec) DecodeValue(dc DecodeContext, vr bsonrw.ValueReader, val r
 		if val.IsNil() {
 			val.Set(reflect.MakeSlice(val.Type(), 0, len(data)))
 		}
-
 		val.SetLen(0)
-		for _, elem := range data {
-			val.Set(reflect.Append(val, reflect.ValueOf(elem)))
-		}
+		val.Set(reflect.AppendSlice(val, reflect.ValueOf(data)))
 		return nil
 	case bsontype.String:
 		if sliceType := val.Type().Elem(); sliceType != tByte {
@@ -164,11 +158,8 @@ func (sc *SliceCodec) DecodeValue(dc DecodeContext, vr bsonrw.ValueReader, val r
 		if val.IsNil() {
 			val.Set(reflect.MakeSlice(val.Type(), 0, len(byteStr)))
 		}
-
 		val.SetLen(0)
-		for _, elem := range byteStr {
-			val.Set(reflect.Append(val, reflect.ValueOf(elem)))
-		}
+		val.Set(reflect.AppendSlice(val, reflect.ValueOf(byteStr)))
 		return nil
 	default:
 		return fmt.Errorf("cannot decode %v into a slice", vrType)
