@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -298,6 +299,8 @@ type Operation struct {
 	// where a default read preference is used when the operation
 	// ReadPreference is not specified.
 	omitReadPreference bool
+
+	reauthCount int
 }
 
 // shouldEncrypt returns true if this operation should automatically be encrypted.
@@ -829,7 +832,7 @@ func (op Operation) Execute(ctx context.Context) error {
 
 			// If the error is no longer retryable and has the NoWritesPerformed label, then we should
 			// set the error to the "previous indefinite error" unless the current error is already the
-			// "previous indefinite error". After reseting, repeat the error check.
+			// "previous indefinite error". After resetting, repeat the error check.
 			if tt.HasErrorLabel(NoWritesPerformed) && !prevIndefiniteErrIsSet {
 				err = prevIndefiniteErr
 				prevIndefiniteErrIsSet = true
@@ -884,6 +887,54 @@ func (op Operation) Execute(ctx context.Context) error {
 			operationErr.Labels = tt.Labels
 			operationErr.Raw = tt.Raw
 		case Error:
+			if tt.Code == 391 && op.reauthCount == 0 {
+				fmt.Println("REAUTHENTICATING")
+				// a, err := auth.CreateAuthenticator("MONGODB-OIDC", nil)
+				// if err != nil {
+				// 	panic(err)
+				// }
+				// a.Auth(ctx, nil)
+
+				err := (&Operation{
+					Clock: op.Clock,
+					CommandFn: func(dst []byte, desc description.SelectedServer) ([]byte, error) {
+						tok, err := os.ReadFile(os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE"))
+						if err != nil {
+							return nil, err
+						}
+						payload, err := bson.Marshal(bson.M{"jwt": string(tok)})
+						if err != nil {
+							return nil, err
+						}
+
+						dst = bsoncore.AppendInt32Element(dst, "saslStart", 1)
+						dst = bsoncore.AppendStringElement(dst, "mechanism", "MONGODB-OIDC")
+						dst = bsoncore.AppendBinaryElement(dst, "payload", 0x00, payload)
+
+						return dst, nil
+					},
+					Database:   "$external",
+					Deployment: op.Deployment,
+					ServerAPI:  op.ServerAPI,
+					ProcessResponseFn: func(ri ResponseInfo) error {
+						// fmt.Println("REAUTH RESPONSE:", ri)
+						return nil
+					},
+					reauthCount: op.reauthCount + 1,
+				}).Execute(ctx)
+				if err != nil {
+					return fmt.Errorf("error reauthenticating: %w", err)
+				}
+				fmt.Println("REAUTHENTICATED")
+
+				if op.Client != nil && op.Client.Committing {
+					// Apply majority write concern for retries
+					op.Client.UpdateCommitTransactionWriteConcern()
+					op.WriteConcern = op.Client.CurrentWc
+				}
+				resetForRetry(tt)
+				continue
+			}
 			if tt.HasErrorLabel(TransientTransactionError) || tt.HasErrorLabel(UnknownTransactionCommitResult) {
 				if err := op.Client.ClearPinnedResources(); err != nil {
 					return err
@@ -926,7 +977,7 @@ func (op Operation) Execute(ctx context.Context) error {
 
 			// If the error is no longer retryable and has the NoWritesPerformed label, then we should
 			// set the error to the "previous indefinite error" unless the current error is already the
-			// "previous indefinite error". After reseting, repeat the error check.
+			// "previous indefinite error". After resetting, repeat the error check.
 			if tt.HasErrorLabel(NoWritesPerformed) && !prevIndefiniteErrIsSet {
 				err = prevIndefiniteErr
 				prevIndefiniteErrIsSet = true
@@ -1856,7 +1907,7 @@ func (op Operation) decodeResult(opcode wiremessage.OpCode, wm []byte) (bsoncore
 					return nil, errors.New("malformed wire message: insufficient bytes to read document sequence")
 				}
 			default:
-				return nil, fmt.Errorf("malformed wire message: uknown section type %v", stype)
+				return nil, fmt.Errorf("malformed wire message: unknown section type %v", stype)
 			}
 		}
 
@@ -1906,6 +1957,7 @@ func (op Operation) canPublishStartedEvent() bool {
 // an unacknowledged write, a CommandSucceededEvent will be published as well. If started events are not being monitored,
 // no events are published.
 func (op Operation) publishStartedEvent(ctx context.Context, info startedInformation) {
+	// fmt.Println("PUBLISH STARTED EVENT", info.cmdName)
 	// If logging is enabled for the command component at the debug level, log the command response.
 	if op.canLogCommandMessage() {
 		host, port, _ := net.SplitHostPort(info.serverAddress.String())

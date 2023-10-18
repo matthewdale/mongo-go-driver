@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -120,7 +121,7 @@ func runTestFile(t *testing.T, filepath string, expectValidFail bool, opts ...*O
 				// catch panics from looking up elements and fail if it's unexpected
 				if r := recover(); r != nil {
 					if !expectValidFail {
-						mt.Fatal(r)
+						mt.Fatal(r, "\n"+string(debug.Stack()))
 					}
 				}
 			}()

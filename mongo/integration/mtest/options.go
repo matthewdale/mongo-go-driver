@@ -58,6 +58,7 @@ type RunOnBlock struct {
 	ServerParameters map[string]bson.RawValue `bson:"serverParameters"`
 	Auth             *bool                    `bson:"auth"`
 	AuthEnabled      *bool                    `bson:"authEnabled"`
+	AuthMechanism    string                   `bson:"authMechanism"`
 	CSFLE            *bool                    `bson:"csfle"`
 }
 
@@ -73,6 +74,7 @@ func (r *RunOnBlock) UnmarshalBSON(data []byte) error {
 		ServerParameters map[string]bson.RawValue `bson:"serverParameters"`
 		Auth             *bool                    `bson:"auth"`
 		AuthEnabled      *bool                    `bson:"authEnabled"`
+		AuthMechanism    string                   `bson:"authMechanism"`
 		CSFLE            *bool                    `bson:"csfle"`
 		Extra            map[string]interface{}   `bson:",inline"`
 	}
@@ -89,6 +91,7 @@ func (r *RunOnBlock) UnmarshalBSON(data []byte) error {
 	r.ServerParameters = temp.ServerParameters
 	r.Auth = temp.Auth
 	r.AuthEnabled = temp.AuthEnabled
+	r.AuthMechanism = temp.AuthMechanism
 	r.CSFLE = temp.CSFLE
 
 	if temp.Topology != nil {

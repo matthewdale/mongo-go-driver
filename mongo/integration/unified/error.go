@@ -8,11 +8,13 @@ package unified
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/x/mongo/driver"
 )
 
 // expectedError represents an error that is expected to occur during a test. This type ignores the "isError" field in
@@ -153,39 +155,54 @@ type errorDetails struct {
 // extractErrorDetails creates an errorDetails instance based on the provided error. It returns the details and an "ok"
 // value which is true if the provided error is of a known type that can be processed.
 func extractErrorDetails(err error) (errorDetails, bool) {
-	var details errorDetails
 
-	switch converted := err.(type) {
-	case mongo.CommandError:
-		details.codes = []int32{converted.Code}
-		details.codeNames = []string{converted.Name}
-		details.labels = converted.Labels
-		details.raw = converted.Raw
-	case mongo.WriteException:
-		if converted.WriteConcernError != nil {
-			details.codes = append(details.codes, int32(converted.WriteConcernError.Code))
-			details.codeNames = append(details.codeNames, converted.WriteConcernError.Name)
+	if cerr := new(mongo.CommandError); errors.As(err, cerr) {
+		return errorDetails{
+			codes:     []int32{cerr.Code},
+			codeNames: []string{cerr.Name},
+			labels:    cerr.Labels,
+			raw:       cerr.Raw,
+		}, true
+	}
+
+	if wex := new(mongo.WriteException); errors.As(err, wex) {
+		var details errorDetails
+		if wex.WriteConcernError != nil {
+			details.codes = append(details.codes, int32(wex.WriteConcernError.Code))
+			details.codeNames = append(details.codeNames, wex.WriteConcernError.Name)
 		}
-		for _, we := range converted.WriteErrors {
+		for _, we := range wex.WriteErrors {
 			details.codes = append(details.codes, int32(we.Code))
 		}
-		details.labels = converted.Labels
-		details.raw = converted.Raw
-	case mongo.BulkWriteException:
-		if converted.WriteConcernError != nil {
-			details.codes = append(details.codes, int32(converted.WriteConcernError.Code))
-			details.codeNames = append(details.codeNames, converted.WriteConcernError.Name)
+		details.labels = wex.Labels
+		details.raw = wex.Raw
+		return details, true
+	}
+
+	if bwex := new(mongo.BulkWriteException); errors.As(err, bwex) {
+		var details errorDetails
+		if bwex.WriteConcernError != nil {
+			details.codes = append(details.codes, int32(bwex.WriteConcernError.Code))
+			details.codeNames = append(details.codeNames, bwex.WriteConcernError.Name)
 		}
-		for _, we := range converted.WriteErrors {
+		for _, we := range bwex.WriteErrors {
 			details.codes = append(details.codes, int32(we.Code))
 			details.raw = we.Raw
 		}
-		details.labels = converted.Labels
-	default:
-		return errorDetails{}, false
+		details.labels = bwex.Labels
+		return details, true
 	}
 
-	return details, true
+	if derr := new(driver.Error); errors.As(err, derr) {
+		return errorDetails{
+			codes:     []int32{derr.Code},
+			codeNames: []string{derr.Name},
+			labels:    derr.Labels,
+			raw:       bson.Raw(derr.Raw),
+		}, true
+	}
+
+	return errorDetails{}, false
 }
 
 func stringSliceContains(arr []string, target string) bool {

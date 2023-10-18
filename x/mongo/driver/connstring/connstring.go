@@ -448,7 +448,7 @@ func (p *parser) setDefaultAuthParams(dbName string) error {
 			p.AuthMechanismProperties["SERVICE_NAME"] = "mongodb"
 		}
 		fallthrough
-	case "mongodb-aws", "mongodb-x509":
+	case "mongodb-aws", "mongodb-x509", "mongodb-oidc":
 		if p.AuthSource == "" {
 			p.AuthSource = "$external"
 		} else if p.AuthSource != "$external" {
@@ -514,6 +514,10 @@ func (p *parser) validateAuth() error {
 		}
 		if token && p.Username == "" && p.Password == "" {
 			return fmt.Errorf("token without username and password is invalid for MONGODB-AWS")
+		}
+	case "mongodb-oidc":
+		if p.Username != "" || p.Password != "" {
+			return fmt.Errorf("username and password cannot be used with for MONGODB-OIDC")
 		}
 	case "gssapi":
 		if p.Username == "" {

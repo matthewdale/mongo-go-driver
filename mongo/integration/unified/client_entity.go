@@ -85,6 +85,7 @@ func newClientEntity(ctx context.Context, em *EntityMap, entityOptions *entityOp
 			ignoredCommands[cmd] = struct{}{}
 		}
 	}
+	// fmt.Println("IGNOREDCOMMANDS:", ignoredCommands)
 	entity := &clientEntity{
 		ignoredCommands:                     ignoredCommands,
 		observedEvents:                      make(map[monitoringEventType]struct{}),
@@ -101,6 +102,7 @@ func newClientEntity(ctx context.Context, em *EntityMap, entityOptions *entityOp
 	uri := getURIForClient(entityOptions)
 	clientOpts := options.Client().ApplyURI(uri)
 	if entityOptions.URIOptions != nil {
+		entityOptions.URIOptions = getURIOptions(entityOptions.URIOptions)
 		if err := setClientOptionsFromURIOptions(clientOpts, entityOptions.URIOptions); err != nil {
 			return nil, fmt.Errorf("error parsing URI options: %w", err)
 		}
@@ -599,6 +601,19 @@ func setClientOptionsFromURIOptions(clientOpts *options.ClientOptions, uriOpts b
 			clientOpts.SetTimeout(time.Duration(value.(int32)) * time.Millisecond)
 		case "serverselectiontimeoutms":
 			clientOpts.SetServerSelectionTimeout(time.Duration(value.(int32)) * time.Millisecond)
+		case "authmechanism":
+			clientOpts.Auth.AuthMechanism = value.(string)
+		case "authsource":
+			clientOpts.Auth.AuthSource = value.(string)
+		case "authmechanismproperties":
+			m := value.(bson.M)
+			props := make(map[string]string, len(m))
+			for k, v := range m {
+				props[k] = v.(string)
+			}
+			clientOpts.Auth.AuthMechanismProperties = props
+			// clientOpts.Auth.Username = "ASIAYDYF24CYC7KXINTE"
+			// clientOpts.Auth.Password = "Ohcvv0y0COM34Q3zMLMNDVQlY6hhLXFIXU+E+JG/"
 		default:
 			return fmt.Errorf("unrecognized URI option %s", key)
 		}

@@ -485,6 +485,12 @@ func (em *EntityMap) addDatabaseEntity(entityOptions *entityOptions) error {
 	return nil
 }
 
+func getURIOptions(uriOptions bson.M) bson.M {
+	// TODO: implement actual logic.
+	uriOptions["authMechanismProperties"] = bson.M{"PROVIDER_NAME": "aws"}
+	return uriOptions
+}
+
 // getKmsCredential processes a value of an input KMS provider credential.
 // An empty document returns from the environment.
 // A string is returned as-is.

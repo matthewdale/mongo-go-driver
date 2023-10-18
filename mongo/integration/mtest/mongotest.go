@@ -778,6 +778,31 @@ func verifyAuthConstraint(expected *bool) error {
 	return nil
 }
 
+func verifyAuthMechanismConstraint(expected string) error {
+	if expected == "" {
+		return nil
+	}
+
+	var serverParameters struct {
+		AuthenticationMechanisms []string `bson:"authenticationMechanisms"`
+	}
+	err := bson.Unmarshal(testContext.serverParameters, &serverParameters)
+	if err != nil {
+		return fmt.Errorf("error parsing authentication mechanisms from server parameters: %w", err)
+	}
+
+	for _, am := range serverParameters.AuthenticationMechanisms {
+		if strings.EqualFold(expected, am) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf(
+		"server does not support authentication mechanism %q (supports %q)",
+		expected,
+		serverParameters.AuthenticationMechanisms)
+}
+
 func verifyServerlessConstraint(expected string) error {
 	switch expected {
 	case "require":
@@ -818,7 +843,9 @@ func verifyRunOnBlockConstraint(rob RunOnBlock) error {
 	if err := verifyAuthConstraint(auth); err != nil {
 		return err
 	}
-
+	if err := verifyAuthMechanismConstraint(rob.AuthMechanism); err != nil {
+		return err
+	}
 	if err := verifyServerlessConstraint(rob.Serverless); err != nil {
 		return err
 	}

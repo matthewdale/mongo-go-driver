@@ -33,6 +33,7 @@ var (
 		"server-discovery-and-monitoring/unified",
 		"run-command",
 		"index-management",
+		"auth/unified",
 	}
 	failDirectories = []string{
 		"unified-test-format/valid-fail",

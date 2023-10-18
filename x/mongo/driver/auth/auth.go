@@ -98,12 +98,14 @@ func (ah *authHandshaker) GetHandshakeInformation(ctx context.Context, addr addr
 				return driver.HandshakeInformation{}, newAuthError("failed to create conversation", err)
 			}
 
-			firstMsg, err := ah.conversation.FirstMessage()
-			if err != nil {
-				return driver.HandshakeInformation{}, newAuthError("failed to create speculative authentication message", err)
-			}
+			if ah.conversation != nil {
+				firstMsg, err := ah.conversation.FirstMessage()
+				if err != nil {
+					return driver.HandshakeInformation{}, newAuthError("failed to create speculative authentication message", err)
+				}
 
-			op = op.SpeculativeAuthenticate(firstMsg)
+				op = op.SpeculativeAuthenticate(firstMsg)
+			}
 		}
 	}
 
@@ -173,13 +175,14 @@ func Handshaker(h driver.Handshaker, options *HandshakeOptions) driver.Handshake
 
 // Config holds the information necessary to perform an authentication attempt.
 type Config struct {
-	Description   description.Server
-	Connection    driver.Connection
-	ClusterClock  *session.ClusterClock
-	HandshakeInfo driver.HandshakeInformation
-	ServerAPI     *driver.ServerAPIOptions
-	HTTPClient    *http.Client
-	OIDCCallback  func(context.Context, *OIDCArgs) (*OIDCToken, error)
+	Description       description.Server
+	Connection        driver.Connection
+	ClusterClock      *session.ClusterClock
+	HandshakeInfo     driver.HandshakeInformation
+	ServerAPI         *driver.ServerAPIOptions
+	HTTPClient        *http.Client
+	OIDCCallback      OIDCCallback
+	OIDCHumanCallback OIDCHumanCallback
 }
 
 // Authenticator handles authenticating a connection.
@@ -196,10 +199,8 @@ func newAuthError(msg string, inner error) error {
 }
 
 func newError(err error, mech string) error {
-	return &Error{
-		message: fmt.Sprintf("unable to authenticate using mechanism \"%s\"", mech),
-		inner:   err,
-	}
+	fmt.Printf("NEWERROR: %q (%T)", err, err)
+	return fmt.Errorf("unable to authenticate using mechanism %q: %w", mech, err)
 }
 
 // Error is an error that occurred during authentication.

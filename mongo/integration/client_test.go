@@ -100,6 +100,36 @@ func (sc *slowConn) Read(b []byte) (n int, err error) {
 	return sc.Conn.Read(b)
 }
 
+func TestOIDC(t *testing.T) {
+	mt := mtest.New(t)
+
+	mt.Run("OIDC", func(mt *mtest.T) {
+		// mt.SetFailPoint(mtest.FailPoint{
+		// 	ConfigureFailPoint: "failCommand",
+		// 	Mode: mtest.FailPointMode{
+		// 		Times: 1,
+		// 	},
+		// 	Data: mtest.FailPointData{
+		// 		FailCommands: []string{"saslStart"},
+		// 		ErrorCode:    18,
+		// 	},
+		// })
+
+		opts := options.Client().
+			ApplyURI("mongodb+srv://oidc-single.oztdp.mongodb-dev.net/?authMechanism=MONGODB-OIDC&authSource=%24external&authMechanismProperties=PROVIDER_NAME:aws")
+		mt.ResetClient(opts)
+
+		_, err := mt.Coll.InsertOne(context.Background(), bson.M{"myField": "myValue"})
+
+		fmt.Println("COMMANDS")
+		for _, evt := range mt.GetAllStartedEvents() {
+			fmt.Println(evt.CommandName)
+		}
+
+		require.NoError(t, err)
+	})
+}
+
 func TestClient(t *testing.T) {
 	mt := mtest.New(t, noClientOpts)
 
