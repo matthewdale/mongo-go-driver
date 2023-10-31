@@ -33,6 +33,7 @@ func init() {
 	RegisterAuthenticatorFactory(GSSAPI, newGSSAPIAuthenticator)
 	RegisterAuthenticatorFactory(MongoDBX509, newMongoDBX509Authenticator)
 	RegisterAuthenticatorFactory(MongoDBAWS, newMongoDBAWSAuthenticator)
+	RegisterAuthenticatorFactory("MONGODB-OIDC", newOIDCAuthenticator)
 }
 
 // CreateAuthenticator creates an authenticator.
@@ -178,6 +179,7 @@ type Config struct {
 	HandshakeInfo driver.HandshakeInformation
 	ServerAPI     *driver.ServerAPIOptions
 	HTTPClient    *http.Client
+	OIDCCallback  func(context.Context, *OIDCArgs) (*OIDCToken, error)
 }
 
 // Authenticator handles authenticating a connection.

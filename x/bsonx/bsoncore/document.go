@@ -305,7 +305,7 @@ func (d Document) Elements() ([]Element, error) {
 	length -= 4
 
 	var elem Element
-	var elems []Element
+	elems := make([]Element, 0, 1000)
 	for length > 1 {
 		elem, rem, ok = ReadElement(rem)
 		length -= int32(len(elem))

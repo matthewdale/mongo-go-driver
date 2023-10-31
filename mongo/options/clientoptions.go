@@ -174,9 +174,18 @@ type BSONOptions struct {
 	ZeroStructs bool
 }
 
+type OIDCArgs struct{}
+
+type OIDCToken struct {
+	AccessToken string
+	ExpiresAt   time.Time
+}
+
 // ClientOptions contains options to configure a Client instance. Each option can be set through setter functions. See
 // documentation for each setter function for an explanation of the option.
 type ClientOptions struct {
+	OIDCCallback func(context.Context, *OIDCArgs) (*OIDCToken, error)
+
 	AppName                  *string
 	Auth                     *Credential
 	AutoEncryptionOptions    *AutoEncryptionOptions
