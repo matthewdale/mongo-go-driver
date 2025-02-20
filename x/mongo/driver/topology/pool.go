@@ -119,10 +119,14 @@ type pool struct {
 	// loop runs or waits. Its lock guards cancelBackgroundCtx, conns, and newConnWait. Any changes
 	// to the state of the guarded values must be made while holding the lock to prevent undefined
 	// behavior in the createConnections() waiting logic.
-	createConnectionsCond *sync.Cond
-	cancelBackgroundCtx   context.CancelFunc    // cancelBackgroundCtx is called to signal background goroutines to stop.
-	conns                 map[int64]*connection // conns holds all currently open connections.
-	newConnWait           wantConnQueue         // newConnWait holds all wantConn requests for new connections.
+	// createConnectionsCond *sync.Cond
+	createConnectionSem chan struct{}
+
+	connsMu             sync.Mutex
+	backgroundCtx       context.Context
+	cancelBackgroundCtx context.CancelFunc    // cancelBackgroundCtx is called to signal background goroutines to stop.
+	conns               map[int64]*connection // conns holds all currently open connections.
+	newConnWait         wantConnQueue         // newConnWait holds all wantConn requests for new connections.
 
 	idleMu         sync.Mutex    // idleMu guards idleConns, idleConnWait
 	idleConns      []*connection // idleConns holds all idle connections.
@@ -210,24 +214,25 @@ func newPool(config poolConfig, connOpts ...ConnectionOption) *pool {
 	}
 
 	pool := &pool{
-		address:               config.Address,
-		minSize:               config.MinPoolSize,
-		maxSize:               config.MaxPoolSize,
-		maxConnecting:         maxConnecting,
-		loadBalanced:          config.LoadBalanced,
-		monitor:               config.PoolMonitor,
-		logger:                config.Logger,
-		handshakeErrFn:        config.handshakeErrFn,
-		connOpts:              connOpts,
-		generation:            newPoolGenerationMap(),
-		state:                 poolPaused,
-		maintainInterval:      maintainInterval,
-		maintainReady:         make(chan struct{}, 1),
-		backgroundDone:        &sync.WaitGroup{},
-		createConnectionsCond: sync.NewCond(&sync.Mutex{}),
-		conns:                 make(map[int64]*connection, config.MaxPoolSize),
-		idleConns:             make([]*connection, 0, config.MaxPoolSize),
-		connectTimeout:        config.ConnectTimeout,
+		address:             config.Address,
+		minSize:             config.MinPoolSize,
+		maxSize:             config.MaxPoolSize,
+		maxConnecting:       maxConnecting,
+		loadBalanced:        config.LoadBalanced,
+		monitor:             config.PoolMonitor,
+		logger:              config.Logger,
+		handshakeErrFn:      config.handshakeErrFn,
+		connOpts:            connOpts,
+		generation:          newPoolGenerationMap(),
+		state:               poolPaused,
+		maintainInterval:    maintainInterval,
+		maintainReady:       make(chan struct{}, 1),
+		backgroundDone:      &sync.WaitGroup{},
+		createConnectionSem: make(chan struct{}, maxConnecting),
+		// createConnectionsCond: sync.NewCond(&sync.Mutex{}),
+		conns:          make(map[int64]*connection, config.MaxPoolSize),
+		idleConns:      make([]*connection, 0, config.MaxPoolSize),
+		connectTimeout: config.ConnectTimeout,
 	}
 	// minSize must not exceed maxSize if maxSize is not 0
 	if pool.maxSize != 0 && pool.minSize > pool.maxSize {
@@ -240,19 +245,18 @@ func newPool(config poolConfig, connOpts ...ConnectionOption) *pool {
 	// Create a Context with cancellation that's used to signal the createConnections() and
 	// maintain() background goroutines to stop. Also create a "backgroundDone" WaitGroup that is
 	// used to wait for the background goroutines to return.
-	var ctx context.Context
-	ctx, pool.cancelBackgroundCtx = context.WithCancel(context.Background())
+	pool.backgroundCtx, pool.cancelBackgroundCtx = context.WithCancel(context.Background())
 
-	for i := 0; i < int(pool.maxConnecting); i++ {
-		pool.backgroundDone.Add(1)
-		go pool.createConnections(ctx, pool.backgroundDone)
-	}
+	// for i := 0; i < int(pool.maxConnecting); i++ {
+	// 	pool.backgroundDone.Add(1)
+	// 	go pool.createConnections(ctx, pool.backgroundDone)
+	// }
 
 	// If maintainInterval is not positive, don't start the maintain() goroutine. Expect that
 	// negative values are only used in testing; this config value is not user-configurable.
 	if maintainInterval > 0 {
 		pool.backgroundDone.Add(1)
-		go pool.maintain(ctx, pool.backgroundDone)
+		go pool.maintain(pool.backgroundCtx, pool.backgroundDone)
 	}
 
 	if mustLogPoolMessage(pool) {
@@ -343,10 +347,9 @@ func (p *pool) close(ctx context.Context) {
 	// condition by cancelling the "background goroutine" Context, even tho cancelling the Context
 	// is also synchronized by a lock. Otherwise, we run into an intermittent bug that prevents the
 	// createConnections() goroutines from exiting.
-	p.createConnectionsCond.L.Lock()
+	p.connsMu.Lock()
 	p.cancelBackgroundCtx()
-	p.createConnectionsCond.Broadcast()
-	p.createConnectionsCond.L.Unlock()
+	p.connsMu.Unlock()
 
 	// Wait for all background goroutines to exit.
 	p.backgroundDone.Wait()
@@ -402,7 +405,7 @@ func (p *pool) close(ctx context.Context) {
 	// Collect all conns from the pool and try to deliver ErrPoolClosed to any waiting wantConns
 	// from newConnWait while holding the createConnectionsCond lock. We can't call removeConnection
 	// on the connections while holding any locks, so do that after we release the lock.
-	p.createConnectionsCond.L.Lock()
+	p.connsMu.Lock()
 	conns := make([]*connection, 0, len(p.conns))
 	for _, conn := range p.conns {
 		conns = append(conns, conn)
@@ -414,7 +417,7 @@ func (p *pool) close(ctx context.Context) {
 		}
 		w.tryDeliver(nil, ErrPoolClosed)
 	}
-	p.createConnectionsCond.L.Unlock()
+	p.connsMu.Unlock()
 
 	if mustLogPoolMessage(p) {
 		logPoolMessage(p, logger.ConnectionPoolClosed)
@@ -724,19 +727,19 @@ func (p *pool) removeConnection(conn *connection, reason reason, err error) erro
 		return ErrWrongPool
 	}
 
-	p.createConnectionsCond.L.Lock()
+	p.connsMu.Lock()
 	_, ok := p.conns[conn.driverConnectionID]
 	if !ok {
 		// If the connection has been removed from the pool already, exit without doing any
 		// additional state changes.
-		p.createConnectionsCond.L.Unlock()
+		p.connsMu.Unlock()
 		return nil
 	}
 	delete(p.conns, conn.driverConnectionID)
 	// Signal the createConnectionsCond so any goroutines waiting for a new connection slot in the
 	// pool will proceed.
-	p.createConnectionsCond.Signal()
-	p.createConnectionsCond.L.Unlock()
+	// p.createConnectionsCond.Signal() // TODO: What do we do with this?
+	p.connsMu.Unlock()
 
 	// Only update the generation numbers map if the connection has retrieved its generation number.
 	// Otherwise, we'd decrement the count for the generation even though it had never been
@@ -1029,7 +1032,7 @@ func (p *pool) clearImpl(err error, serviceID *bson.ObjectID, interruptAllConnec
 
 	p.removePerishedConns()
 	if interruptAllConnections {
-		p.createConnectionsCond.L.Lock()
+		p.connsMu.Lock()
 		p.idleMu.Lock()
 
 		idleConns := make(map[*connection]bool, len(p.idleConns))
@@ -1045,7 +1048,7 @@ func (p *pool) clearImpl(err error, serviceID *bson.ObjectID, interruptAllConnec
 		}
 
 		p.idleMu.Unlock()
-		p.createConnectionsCond.L.Unlock()
+		p.connsMu.Unlock()
 
 		p.interruptConnections(conns)
 	}
@@ -1067,7 +1070,7 @@ func (p *pool) clearImpl(err error, serviceID *bson.ObjectID, interruptAllConnec
 		// Clear the new connections wait queue. This effectively pauses the createConnections()
 		// background goroutine because newConnWait is empty and checkOut() won't insert any more
 		// wantConns into newConnWait until the pool is marked "ready" again.
-		p.createConnectionsCond.L.Lock()
+		p.connsMu.Lock()
 		for {
 			w := p.newConnWait.popFront()
 			if w == nil {
@@ -1075,7 +1078,7 @@ func (p *pool) clearImpl(err error, serviceID *bson.ObjectID, interruptAllConnec
 			}
 			w.tryDeliver(nil, pcErr)
 		}
-		p.createConnectionsCond.L.Unlock()
+		p.connsMu.Unlock()
 	}
 }
 
@@ -1121,17 +1124,19 @@ func (p *pool) getOrQueueForIdleConn(w *wantConn) bool {
 }
 
 func (p *pool) queueForNewConn(w *wantConn) {
-	p.createConnectionsCond.L.Lock()
-	defer p.createConnectionsCond.L.Unlock()
+	p.connsMu.Lock()
+	defer p.connsMu.Unlock()
 
 	p.newConnWait.cleanFront()
 	p.newConnWait.pushBack(w)
-	p.createConnectionsCond.Signal()
+
+	p.backgroundDone.Add(1)
+	go p.createConnection(p.backgroundCtx, p.backgroundDone)
 }
 
 func (p *pool) totalConnectionCount() int {
-	p.createConnectionsCond.L.Lock()
-	defer p.createConnectionsCond.L.Unlock()
+	p.connsMu.Lock()
+	defer p.connsMu.Unlock()
 
 	return len(p.conns)
 }
@@ -1144,32 +1149,34 @@ func (p *pool) availableConnectionCount() int {
 }
 
 // createConnections creates connections for wantConn requests on the newConnWait queue.
-func (p *pool) createConnections(ctx context.Context, wg *sync.WaitGroup) {
+func (p *pool) createConnection(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	// condition returns true if the createConnections() loop should continue and false if it should
-	// wait. Note that the condition also listens for Context cancellation, which also causes the
-	// loop to continue, allowing for a subsequent check to return from createConnections().
-	condition := func() bool {
-		checkOutWaiting := p.newConnWait.len() > 0
-		poolHasSpace := p.maxSize == 0 || uint64(len(p.conns)) < p.maxSize
-		cancelled := ctx.Err() != nil
-		return (checkOutWaiting && poolHasSpace) || cancelled
+	// TODO: Do we want to perma-block here? Seems like that could create a
+	// bunch of waiting goroutines that will never complete until the pool
+	// is disconnected.
+	select {
+	case p.createConnectionSem <- struct{}{}:
+		defer func() {
+			<-p.createConnectionSem
+		}()
+	case <-ctx.Done():
+		return
+	case <-time.After(10 * time.Millisecond):
+		return
 	}
 
-	// wait waits for there to be an available wantConn and for the pool to have space for a new
-	// connection. When the condition becomes true, it creates a new connection and returns the
-	// waiting wantConn and new connection. If the Context is cancelled or there are any
-	// errors, wait returns with "ok = false".
-	wait := func() (*wantConn, *connection, bool) {
-		p.createConnectionsCond.L.Lock()
-		defer p.createConnectionsCond.L.Unlock()
+	nextWaiter := func() (*wantConn, *connection, bool) {
+		p.connsMu.Lock()
+		defer p.connsMu.Unlock()
 
-		for !condition() {
-			p.createConnectionsCond.Wait()
+		// TODO: Do we need this check here?
+		if ctx.Err() != nil {
+			return nil, nil, false
 		}
 
-		if ctx.Err() != nil {
+		// TODO: Is this condition correct?
+		if p.maxSize > 0 && uint64(len(p.conns)) >= p.maxSize {
 			return nil, nil, false
 		}
 
@@ -1187,98 +1194,233 @@ func (p *pool) createConnections(ctx context.Context, wg *sync.WaitGroup) {
 		return w, conn, true
 	}
 
-	for ctx.Err() == nil {
-		w, conn, ok := wait()
-		if !ok {
-			continue
-		}
-
-		if mustLogPoolMessage(p) {
-			keysAndValues := logger.KeyValues{
-				logger.KeyDriverConnectionID, conn.driverConnectionID,
-			}
-
-			logPoolMessage(p, logger.ConnectionCreated, keysAndValues...)
-		}
-
-		if p.monitor != nil {
-			p.monitor.Event(&event.PoolEvent{
-				Type:         event.ConnectionCreated,
-				Address:      p.address.String(),
-				ConnectionID: conn.driverConnectionID,
-			})
-		}
-
-		start := time.Now()
-		// Pass the createConnections context to connect to allow pool close to
-		// cancel connection establishment so shutdown doesn't block indefinitely if
-		// connectTimeout=0.
-		//
-		// Per the specifications, an explicit value of connectTimeout=0 means the
-		// timeout is "infinite".
-
-		var cancel context.CancelFunc
-
-		connctx := context.Background()
-		if p.connectTimeout != 0 {
-			connctx, cancel = context.WithTimeout(ctx, p.connectTimeout)
-		}
-
-		err := conn.connect(connctx)
-
-		if cancel != nil {
-			cancel()
-		}
-
-		if err != nil {
-			w.tryDeliver(nil, err)
-
-			// If there's an error connecting the new connection, call the handshake error handler
-			// that implements the SDAM handshake error handling logic. This must be called after
-			// delivering the connection error to the waiting wantConn. If it's called before, the
-			// handshake error handler may clear the connection pool, leading to a different error
-			// message being delivered to the same waiting wantConn in idleConnWait when the wait
-			// queues are cleared.
-			if p.handshakeErrFn != nil {
-				p.handshakeErrFn(err, conn.generation, conn.desc.ServiceID)
-			}
-
-			_ = p.removeConnection(conn, reason{
-				loggerConn: logger.ReasonConnClosedError,
-				event:      event.ReasonError,
-			}, err)
-
-			_ = p.closeConnection(conn)
-
-			continue
-		}
-
-		duration := time.Since(start)
-		if mustLogPoolMessage(p) {
-			keysAndValues := logger.KeyValues{
-				logger.KeyDriverConnectionID, conn.driverConnectionID,
-				logger.KeyDurationMS, duration.Milliseconds(),
-			}
-
-			logPoolMessage(p, logger.ConnectionReady, keysAndValues...)
-		}
-
-		if p.monitor != nil {
-			p.monitor.Event(&event.PoolEvent{
-				Type:         event.ConnectionReady,
-				Address:      p.address.String(),
-				ConnectionID: conn.driverConnectionID,
-				Duration:     duration,
-			})
-		}
-
-		if w.tryDeliver(conn, nil) {
-			continue
-		}
-
-		_ = p.checkInNoEvent(conn)
+	w, conn, ok := nextWaiter()
+	if !ok {
+		return
 	}
+
+	if mustLogPoolMessage(p) {
+		keysAndValues := logger.KeyValues{
+			logger.KeyDriverConnectionID, conn.driverConnectionID,
+		}
+
+		logPoolMessage(p, logger.ConnectionCreated, keysAndValues...)
+	}
+
+	if p.monitor != nil {
+		p.monitor.Event(&event.PoolEvent{
+			Type:         event.ConnectionCreated,
+			Address:      p.address.String(),
+			ConnectionID: conn.driverConnectionID,
+		})
+	}
+
+	start := time.Now()
+	// Pass the createConnections context to connect to allow pool close to
+	// cancel connection establishment so shutdown doesn't block indefinitely if
+	// connectTimeout=0.
+	//
+	// Per the specifications, an explicit value of connectTimeout=0 means the
+	// timeout is "infinite".
+
+	var cancel context.CancelFunc
+
+	connctx := context.Background()
+	if p.connectTimeout != 0 {
+		connctx, cancel = context.WithTimeout(ctx, p.connectTimeout)
+	}
+
+	err := conn.connect(connctx)
+
+	if cancel != nil {
+		cancel()
+	}
+
+	if err != nil {
+		w.tryDeliver(nil, err)
+
+		// If there's an error connecting the new connection, call the handshake error handler
+		// that implements the SDAM handshake error handling logic. This must be called after
+		// delivering the connection error to the waiting wantConn. If it's called before, the
+		// handshake error handler may clear the connection pool, leading to a different error
+		// message being delivered to the same waiting wantConn in idleConnWait when the wait
+		// queues are cleared.
+		if p.handshakeErrFn != nil {
+			p.handshakeErrFn(err, conn.generation, conn.desc.ServiceID)
+		}
+
+		_ = p.removeConnection(conn, reason{
+			loggerConn: logger.ReasonConnClosedError,
+			event:      event.ReasonError,
+		}, err)
+
+		_ = p.closeConnection(conn)
+
+		return
+	}
+
+	duration := time.Since(start)
+	if mustLogPoolMessage(p) {
+		keysAndValues := logger.KeyValues{
+			logger.KeyDriverConnectionID, conn.driverConnectionID,
+			logger.KeyDurationMS, duration.Milliseconds(),
+		}
+
+		logPoolMessage(p, logger.ConnectionReady, keysAndValues...)
+	}
+
+	if p.monitor != nil {
+		p.monitor.Event(&event.PoolEvent{
+			Type:         event.ConnectionReady,
+			Address:      p.address.String(),
+			ConnectionID: conn.driverConnectionID,
+			Duration:     duration,
+		})
+	}
+
+	if w.tryDeliver(conn, nil) {
+		return
+	}
+
+	_ = p.checkInNoEvent(conn)
 }
+
+// createConnections creates connections for wantConn requests on the newConnWait queue.
+// func (p *pool) createConnections(ctx context.Context, wg *sync.WaitGroup) {
+// 	defer wg.Done()
+
+// 	// condition returns true if the createConnections() loop should continue and false if it should
+// 	// wait. Note that the condition also listens for Context cancellation, which also causes the
+// 	// loop to continue, allowing for a subsequent check to return from createConnections().
+// 	condition := func() bool {
+// 		checkOutWaiting := p.newConnWait.len() > 0
+// 		poolHasSpace := p.maxSize == 0 || uint64(len(p.conns)) < p.maxSize
+// 		cancelled := ctx.Err() != nil
+// 		return (checkOutWaiting && poolHasSpace) || cancelled
+// 	}
+
+// 	// wait waits for there to be an available wantConn and for the pool to have space for a new
+// 	// connection. When the condition becomes true, it creates a new connection and returns the
+// 	// waiting wantConn and new connection. If the Context is cancelled or there are any
+// 	// errors, wait returns with "ok = false".
+// 	wait := func() (*wantConn, *connection, bool) {
+// 		p.createConnectionsCond.L.Lock()
+// 		defer p.createConnectionsCond.L.Unlock()
+
+// 		for !condition() {
+// 			p.createConnectionsCond.Wait()
+// 		}
+
+// 		if ctx.Err() != nil {
+// 			return nil, nil, false
+// 		}
+
+// 		p.newConnWait.cleanFront()
+// 		w := p.newConnWait.popFront()
+// 		if w == nil {
+// 			return nil, nil, false
+// 		}
+
+// 		conn := newConnection(p.address, p.connOpts...)
+// 		conn.pool = p
+// 		conn.driverConnectionID = atomic.AddInt64(&p.nextID, 1)
+// 		p.conns[conn.driverConnectionID] = conn
+
+// 		return w, conn, true
+// 	}
+
+// 	for ctx.Err() == nil {
+// 		w, conn, ok := wait()
+// 		if !ok {
+// 			continue
+// 		}
+
+// 		if mustLogPoolMessage(p) {
+// 			keysAndValues := logger.KeyValues{
+// 				logger.KeyDriverConnectionID, conn.driverConnectionID,
+// 			}
+
+// 			logPoolMessage(p, logger.ConnectionCreated, keysAndValues...)
+// 		}
+
+// 		if p.monitor != nil {
+// 			p.monitor.Event(&event.PoolEvent{
+// 				Type:         event.ConnectionCreated,
+// 				Address:      p.address.String(),
+// 				ConnectionID: conn.driverConnectionID,
+// 			})
+// 		}
+
+// 		start := time.Now()
+// 		// Pass the createConnections context to connect to allow pool close to
+// 		// cancel connection establishment so shutdown doesn't block indefinitely if
+// 		// connectTimeout=0.
+// 		//
+// 		// Per the specifications, an explicit value of connectTimeout=0 means the
+// 		// timeout is "infinite".
+
+// 		var cancel context.CancelFunc
+
+// 		connctx := context.Background()
+// 		if p.connectTimeout != 0 {
+// 			connctx, cancel = context.WithTimeout(ctx, p.connectTimeout)
+// 		}
+
+// 		err := conn.connect(connctx)
+
+// 		if cancel != nil {
+// 			cancel()
+// 		}
+
+// 		if err != nil {
+// 			w.tryDeliver(nil, err)
+
+// 			// If there's an error connecting the new connection, call the handshake error handler
+// 			// that implements the SDAM handshake error handling logic. This must be called after
+// 			// delivering the connection error to the waiting wantConn. If it's called before, the
+// 			// handshake error handler may clear the connection pool, leading to a different error
+// 			// message being delivered to the same waiting wantConn in idleConnWait when the wait
+// 			// queues are cleared.
+// 			if p.handshakeErrFn != nil {
+// 				p.handshakeErrFn(err, conn.generation, conn.desc.ServiceID)
+// 			}
+
+// 			_ = p.removeConnection(conn, reason{
+// 				loggerConn: logger.ReasonConnClosedError,
+// 				event:      event.ReasonError,
+// 			}, err)
+
+// 			_ = p.closeConnection(conn)
+
+// 			continue
+// 		}
+
+// 		duration := time.Since(start)
+// 		if mustLogPoolMessage(p) {
+// 			keysAndValues := logger.KeyValues{
+// 				logger.KeyDriverConnectionID, conn.driverConnectionID,
+// 				logger.KeyDurationMS, duration.Milliseconds(),
+// 			}
+
+// 			logPoolMessage(p, logger.ConnectionReady, keysAndValues...)
+// 		}
+
+// 		if p.monitor != nil {
+// 			p.monitor.Event(&event.PoolEvent{
+// 				Type:         event.ConnectionReady,
+// 				Address:      p.address.String(),
+// 				ConnectionID: conn.driverConnectionID,
+// 				Duration:     duration,
+// 			})
+// 		}
+
+// 		if w.tryDeliver(conn, nil) {
+// 			continue
+// 		}
+
+// 		_ = p.checkInNoEvent(conn)
+// 	}
+// }
 
 func (p *pool) maintain(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
