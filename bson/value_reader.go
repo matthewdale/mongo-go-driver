@@ -8,6 +8,7 @@ package bson
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -32,7 +33,7 @@ type vrState struct {
 
 var bufioReaderPool = sync.Pool{
 	New: func() interface{} {
-		return bufio.NewReader(nil)
+		return bufio.NewReaderSize(nil, 16*1024*1024)
 	},
 }
 
@@ -298,12 +299,16 @@ func (vr *valueReader) appendNextElement(dst []byte) ([]byte, error) {
 	buf, err := vr.r.Peek(int(length))
 	if err != nil {
 		if err == bufio.ErrBufferFull {
-			temp := make([]byte, length)
-			if _, err = io.ReadFull(vr.r, temp); err != nil {
+			b, err := vr.r.Peek(int(length))
+			if err != nil {
 				return nil, err
 			}
-			dst = append(dst, temp...)
-			vr.offset += int64(len(temp))
+			_, err = vr.r.Discard(int(length))
+			if err != nil {
+				return nil, err
+			}
+			dst = append(dst, b...)
+			vr.offset += int64(len(b))
 			return dst, nil
 		}
 
@@ -399,8 +404,7 @@ func (vr *valueReader) ReadBinary() (b []byte, btype byte, err error) {
 		}
 	}
 
-	b = make([]byte, length)
-	err = vr.read(b)
+	b, err = vr.read(length)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -476,8 +480,7 @@ func (vr *valueReader) ReadCodeWithScope() (code string, dr DocumentReader, err 
 	if strLength <= 0 {
 		return "", nil, fmt.Errorf("invalid string length: %d", strLength)
 	}
-	strBytes := make([]byte, strLength)
-	err = vr.read(strBytes)
+	strBytes, err := vr.read(strLength)
 	if err != nil {
 		return "", nil, err
 	}
@@ -510,10 +513,11 @@ func (vr *valueReader) ReadDBPointer() (ns string, oid ObjectID, err error) {
 		return "", oid, err
 	}
 
-	err = vr.read(oid[:])
+	b, err := vr.read(int32(len(oid)))
 	if err != nil {
 		return "", ObjectID{}, err
 	}
+	copy(oid[:], b)
 
 	if err := vr.pop(); err != nil {
 		return "", ObjectID{}, err
@@ -542,8 +546,7 @@ func (vr *valueReader) ReadDecimal128() (Decimal128, error) {
 		return Decimal128{}, err
 	}
 
-	var b [16]byte
-	err := vr.read(b[:])
+	b, err := vr.read(16)
 	if err != nil {
 		return Decimal128{}, err
 	}
@@ -636,10 +639,11 @@ func (vr *valueReader) ReadObjectID() (ObjectID, error) {
 	}
 
 	var oid ObjectID
-	err := vr.read(oid[:])
+	b, err := vr.read(int32(len(oid)))
 	if err != nil {
 		return ObjectID{}, err
 	}
+	copy(oid[:], b)
 
 	if err := vr.pop(); err != nil {
 		return ObjectID{}, err
@@ -778,18 +782,21 @@ func (vr *valueReader) ReadValue() (ValueReader, error) {
 	return vr, nil
 }
 
-func (vr *valueReader) read(p []byte) error {
-	n, err := io.ReadFull(vr.r, p)
+func (vr *valueReader) read(n int32) ([]byte, error) {
+	b, err := vr.r.Peek(int(n))
 	if err != nil {
-		return err
+		return nil, err
+	}
+	_, err = vr.r.Discard(int(n))
+	if err != nil {
+		return nil, err
 	}
 	vr.offset += int64(n)
-	return nil
+	return b, nil
 }
 
 func (vr *valueReader) appendBytes(dst []byte, length int32) ([]byte, error) {
-	buf := make([]byte, length)
-	err := vr.read(buf)
+	buf, err := vr.read(length)
 	if err != nil {
 		return nil, err
 	}
@@ -806,13 +813,21 @@ func (vr *valueReader) readByte() (byte, error) {
 }
 
 func (vr *valueReader) readCString() (string, error) {
-	str, err := vr.r.ReadString(0x00)
+	// str, err := vr.r.ReadString(0x00)
+	d, err := vr.r.Peek(vr.r.Buffered())
 	if err != nil {
 		return "", err
 	}
-	l := len(str)
-	vr.offset += int64(l)
-	return str[:l-1], nil
+	idx := bytes.IndexByte(d, 0x00)
+	if idx < 0 {
+		return "", io.EOF
+	}
+	_, err = vr.r.Discard(idx + 1)
+	if err != nil {
+		return "", err
+	}
+	vr.offset += int64(idx) + 1
+	return string(d[:idx]), nil
 }
 
 func (vr *valueReader) readString() (string, error) {
@@ -824,8 +839,7 @@ func (vr *valueReader) readString() (string, error) {
 		return "", fmt.Errorf("invalid string length: %d", length)
 	}
 
-	buf := make([]byte, length)
-	err = vr.read(buf)
+	buf, err := vr.read(length)
 	if err != nil {
 		return "", err
 	}
@@ -858,8 +872,7 @@ func (vr *valueReader) readLength() (int32, error) {
 }
 
 func (vr *valueReader) readi32() (int32, error) {
-	var buf [4]byte
-	err := vr.read(buf[:])
+	buf, err := vr.read(4)
 	if err != nil {
 		return 0, err
 	}
@@ -868,8 +881,7 @@ func (vr *valueReader) readi32() (int32, error) {
 }
 
 func (vr *valueReader) readu32() (uint32, error) {
-	var buf [4]byte
-	err := vr.read(buf[:])
+	buf, err := vr.read(4)
 	if err != nil {
 		return 0, err
 	}
@@ -878,8 +890,7 @@ func (vr *valueReader) readu32() (uint32, error) {
 }
 
 func (vr *valueReader) readi64() (int64, error) {
-	var buf [8]byte
-	err := vr.read(buf[:])
+	buf, err := vr.read(8)
 	if err != nil {
 		return 0, err
 	}
@@ -888,8 +899,7 @@ func (vr *valueReader) readi64() (int64, error) {
 }
 
 func (vr *valueReader) readu64() (uint64, error) {
-	var buf [8]byte
-	err := vr.read(buf[:])
+	buf, err := vr.read(8)
 	if err != nil {
 		return 0, err
 	}
