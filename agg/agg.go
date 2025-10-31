@@ -47,12 +47,17 @@ func SortStage[T Expression | SortSpec](sort ...T) Stage {
 	return Stage{{Key: "$sort", Value: sort}}
 }
 
+type GroupKey []struct {
+	Name       string
+	Expression Expression
+}
+
 type GroupField struct {
 	Name        string
 	Accumulator Accumulator
 }
 
-func GroupStage[T Expression | string](_id T, field ...GroupField) Stage {
+func GroupStage[T string | GroupKey | Expression](_id T, field ...GroupField) Stage {
 	fields := make(bson.D, 0, len(field))
 	fields = append(fields, bson.E{Key: "_id", Value: _id})
 	for _, f := range field {
@@ -148,6 +153,10 @@ func PercentileAccumulator[T ResolvesToNumber | Number, U ResolvesToArray | []fl
 
 // TODO: Is there a more constrained set of types we can use here?
 type Expression any
+
+func FieldPath(field string) Expression {
+	return "$" + field
+}
 
 type ResolvesToNumber struct {
 	expr Expression
