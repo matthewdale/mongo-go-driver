@@ -154,7 +154,7 @@ func PercentileAccumulator[T ResolvesToNumber | Number, U ResolvesToArray | []fl
 // TODO: Is there a more constrained set of types we can use here?
 type Expression any
 
-func FieldPath(field string) Expression {
+func Field(field string) Expression {
 	return "$" + field
 }
 
@@ -167,7 +167,7 @@ func (rtn ResolvesToNumber) MarshalBSONValue() (byte, []byte, error) {
 	return byte(typ), b, err
 }
 
-func NumberFieldPath(field string) ResolvesToNumber {
+func NumberField(field string) ResolvesToNumber {
 	return ResolvesToNumber{
 		expr: "$" + field,
 	}
@@ -182,7 +182,7 @@ func (rta ResolvesToArray) MarshalBSONValue() (byte, []byte, error) {
 	return byte(typ), b, err
 }
 
-func ArrayFieldPath(field string) ResolvesToArray {
+func ArrayField(field string) ResolvesToArray {
 	return ResolvesToArray{
 		expr: "$" + field,
 	}
@@ -203,7 +203,7 @@ func (rto ResolvesToObject) MarshalBSONValue() (byte, []byte, error) {
 	return byte(typ), b, err
 }
 
-func ObjectFieldPath(field string) ResolvesToObject {
+func ObjectField(field string) ResolvesToObject {
 	return ResolvesToObject{
 		expr: "$" + field,
 	}

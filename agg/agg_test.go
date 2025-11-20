@@ -79,24 +79,24 @@ func Test_computeAggregates(t *testing.T) {
 			"field",
 			agg.GroupField{
 				Name:        "numChanges",
-				Accumulator: agg.AvgAccumulator(agg.Size(agg.ArrayFieldPath("prices"))),
+				Accumulator: agg.AvgAccumulator(agg.Size(agg.ArrayField("prices"))),
 			},
 			agg.GroupField{
 				Name:        "lowestPrice",
-				Accumulator: agg.MinAccumulator(agg.NumberFieldPath("prices.price")),
+				Accumulator: agg.MinAccumulator(agg.NumberField("prices.price")),
 			},
 			agg.GroupField{
 				Name:        "highestPrice",
-				Accumulator: agg.MaxAccumulator(agg.NumberFieldPath("prices.price")),
+				Accumulator: agg.MaxAccumulator(agg.NumberField("prices.price")),
 			},
 			agg.GroupField{
 				Name:        "weightedAveragePrice",
-				Accumulator: agg.AvgAccumulator(agg.NumberFieldPath("weightedAveragePrice")),
+				Accumulator: agg.AvgAccumulator(agg.NumberField("weightedAveragePrice")),
 			},
 			agg.GroupField{
 				Name: "percentiles",
 				Accumulator: agg.PercentileAccumulator(
-					agg.NumberFieldPath("weightedAveragePrice"),
+					agg.NumberField("weightedAveragePrice"),
 					percentiles,
 				),
 			},
@@ -106,7 +106,7 @@ func Test_computeAggregates(t *testing.T) {
 			Expression: agg.ArrayToObject(agg.Zip(
 				[]agg.ResolvesToArray{
 					agg.Array(percentiles),
-					agg.ArrayFieldPath("percentiles"),
+					agg.ArrayField("percentiles"),
 				},
 				true,
 				[]float64{},
@@ -114,7 +114,7 @@ func Test_computeAggregates(t *testing.T) {
 		}),
 		agg.ReplaceWithStage(
 			agg.MergeObjects(
-				agg.ObjectFieldPath("_id"),
+				agg.ObjectField("_id"),
 				agg.RootObject())),
 		agg.UnsetStage("_id"),
 	}
