@@ -22,6 +22,29 @@ func Example() {
 			}),
 	}
 
+	agg.ProjectStage(
+		agg.NamedExpression{
+			Name: "distanceValues",
+			Expression: agg.Reduce(
+				agg.Map("$distances", "decimalValue", agg.Trunc("$$decimalValue", 0)),
+				0,
+				agg.ConcatArrays("$$value", "$$this"),
+			),
+		},
+		agg.NamedExpression{
+			Name:       "integerValues",
+			Expression: agg.Map("$distances", "decimalValue", "$$decimalValue"),
+		})
+
+	agg.GroupStage(
+		agg.GroupKey{
+			{"timestamp", "$timestamp"},
+			{"storage_system_id", "$storage_system_id"},
+			{"name", "$name"},
+		},
+		agg.GroupField{"blah", agg.AvgAccumulator("blah")},
+	)
+
 	b, err := bson.Marshal(pipeline)
 	if err != nil {
 		panic(err)
@@ -79,26 +102,23 @@ func Test_computeAggregates(t *testing.T) {
 			"field",
 			agg.GroupField{
 				Name:        "numChanges",
-				Accumulator: agg.AvgAccumulator(agg.Size(agg.ArrayField("prices"))),
+				Accumulator: agg.AvgAccumulator(agg.Size("$prices")),
 			},
 			agg.GroupField{
 				Name:        "lowestPrice",
-				Accumulator: agg.MinAccumulator(agg.NumberField("prices.price")),
+				Accumulator: agg.MinAccumulator("$prices.price"),
 			},
 			agg.GroupField{
 				Name:        "highestPrice",
-				Accumulator: agg.MaxAccumulator(agg.NumberField("prices.price")),
+				Accumulator: agg.MaxAccumulator("$prices.price"),
 			},
 			agg.GroupField{
 				Name:        "weightedAveragePrice",
-				Accumulator: agg.AvgAccumulator(agg.NumberField("weightedAveragePrice")),
+				Accumulator: agg.AvgAccumulator("$weightedAveragePrice"),
 			},
 			agg.GroupField{
-				Name: "percentiles",
-				Accumulator: agg.PercentileAccumulator(
-					agg.NumberField("weightedAveragePrice"),
-					percentiles,
-				),
+				Name:        "percentiles",
+				Accumulator: agg.PercentileAccumulator("$weightedAveragePrice", percentiles),
 			},
 		),
 		agg.SetStage(agg.NamedExpression{
@@ -106,7 +126,7 @@ func Test_computeAggregates(t *testing.T) {
 			Expression: agg.ArrayToObject(agg.Zip(
 				[]agg.ResolvesToArray{
 					agg.Array(percentiles),
-					agg.ArrayField("percentiles"),
+					agg.ArrayField("$percentiles"),
 				},
 				true,
 				[]float64{},
@@ -114,7 +134,7 @@ func Test_computeAggregates(t *testing.T) {
 		}),
 		agg.ReplaceWithStage(
 			agg.MergeObjects(
-				agg.ObjectField("_id"),
+				agg.ObjectField("$_id"),
 				agg.RootObject())),
 		agg.UnsetStage("_id"),
 	}
@@ -164,6 +184,60 @@ func Test_computeAggregates(t *testing.T) {
 			{Key: "$unset", Value: bson.A{"_id"}},
 		},
 	}}})
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	if !bytes.Equal(want, got) {
+		t.Errorf(
+			"Pipelines don't match.\nWant: %s\nGot:  %s",
+			bson.Raw(want).String(),
+			bson.Raw(got).String())
+	}
+}
+
+func Test_mapReduce(t *testing.T) {
+	pipeline := agg.Pipeline{
+		agg.ProjectStage(
+			agg.NamedExpression{
+				Name: "distanceValues",
+				Expression: agg.Reduce(
+					agg.Map("$distances", "decimalValue", agg.Trunc("$$decimalValue", 0)),
+					0,
+					agg.ConcatArrays("$$value", "$$this"),
+				),
+			}),
+	}
+	got, err := bson.Marshal(pipeline)
+	if err != nil {
+		panic(err)
+	}
+
+	want, err := bson.Marshal(bson.D{
+		{"pipeline", bson.A{
+			bson.D{
+				{"$project", bson.D{
+					{"distanceValues", bson.D{
+						{"$reduce", bson.D{
+							{"input", bson.D{
+								{"$map", bson.D{
+									{"input", "$distances"},
+									{"as", "decimalValue"},
+									{"in", bson.D{
+										{"$trunc", bson.A{"$$decimalValue", 0}},
+									}},
+								}},
+							}},
+							{"initialValue", 0},
+							{"in", bson.D{
+								{"$concatArrays", bson.A{"$$value", "$$this"}},
+							}},
+						}},
+					}},
+				}},
+			}},
+		},
+	})
 	if err != nil {
 		t.Fatalf("Marshal error: %v", err)
 	}

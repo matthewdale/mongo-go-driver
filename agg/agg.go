@@ -10,6 +10,22 @@ type Number interface {
 		~float32 | ~float64
 }
 
+type ArrayTypes interface {
+	ResolvesToAny | ResolvesToArray | string
+}
+
+type NumberTypes interface {
+	ResolvesToAny | ResolvesToNumber | Number | string
+}
+
+type StringTypes interface {
+	ResolvesToAny | ResolvesToString | string
+}
+
+type BoolTypes interface {
+	ResolvesToAny | ResolvesToBool | bool
+}
+
 type Pipeline []Stage
 
 func (p Pipeline) MarshalBSON() ([]byte, error) {
@@ -43,7 +59,7 @@ type SortSpec struct {
 	Order SortOrder
 }
 
-func SortStage[T Expression | SortSpec](sort ...T) Stage {
+func SortStage[T SortSpec | Expression](sort ...T) Stage {
 	return Stage{{Key: "$sort", Value: sort}}
 }
 
@@ -57,7 +73,7 @@ type GroupField struct {
 	Accumulator Accumulator
 }
 
-func GroupStage[T string | GroupKey | Expression](_id T, field ...GroupField) Stage {
+func GroupStage[T GroupKey | Expression | string](_id T, field ...GroupField) Stage {
 	fields := make(bson.D, 0, len(field))
 	fields = append(fields, bson.E{Key: "_id", Value: _id})
 	for _, f := range field {
@@ -107,7 +123,7 @@ func (a Accumulator) MarshalBSON() ([]byte, error) {
 	return bson.Marshal(a.doc)
 }
 
-func LastNAccumulator[T ResolvesToNumber | Number](input ResolvesToArray, n T) Accumulator {
+func LastNAccumulator[T NumberTypes](input ResolvesToArray, n T) Accumulator {
 	return Accumulator{
 		doc: bson.D{{Key: "$lastN", Value: bson.D{
 			{Key: "input", Value: input},
@@ -116,31 +132,31 @@ func LastNAccumulator[T ResolvesToNumber | Number](input ResolvesToArray, n T) A
 	}
 }
 
-func AvgAccumulator[T ResolvesToNumber | Number](expression T) Accumulator {
+func AvgAccumulator[T NumberTypes](expr T) Accumulator {
 	return Accumulator{
-		doc: bson.D{{Key: "$avg", Value: expression}},
+		doc: bson.D{{Key: "$avg", Value: expr}},
 	}
 }
 
-func SumAccumulator[T ResolvesToNumber | Number](expression T) Accumulator {
+func SumAccumulator[T NumberTypes](expr T) Accumulator {
 	return Accumulator{
-		doc: bson.D{{Key: "$sum", Value: expression}},
+		doc: bson.D{{Key: "$sum", Value: expr}},
 	}
 }
 
-func MinAccumulator[T ResolvesToNumber | Number](expression T) Accumulator {
+func MinAccumulator[T NumberTypes](expr T) Accumulator {
 	return Accumulator{
-		doc: bson.D{{Key: "$min", Value: expression}},
+		doc: bson.D{{Key: "$min", Value: expr}},
 	}
 }
 
-func MaxAccumulator[T ResolvesToNumber | Number](expression T) Accumulator {
+func MaxAccumulator[T NumberTypes](expr T) Accumulator {
 	return Accumulator{
-		doc: bson.D{{Key: "$max", Value: expression}},
+		doc: bson.D{{Key: "$max", Value: expr}},
 	}
 }
 
-func PercentileAccumulator[T ResolvesToNumber | Number, U ResolvesToArray | []float32 | []float64](input T, p U) Accumulator {
+func PercentileAccumulator[T NumberTypes, U ArrayTypes | []float32 | []float64](input T, p U) Accumulator {
 	return Accumulator{
 		doc: bson.D{{Key: "$percentile", Value: bson.D{
 			{Key: "input", Value: input},
@@ -151,12 +167,14 @@ func PercentileAccumulator[T ResolvesToNumber | Number, U ResolvesToArray | []fl
 	}
 }
 
+func PushAccumulator(expr Expression) Accumulator {
+	return Accumulator{
+		doc: bson.D{{Key: "$push", Value: expr}},
+	}
+}
+
 // TODO: Is there a more constrained set of types we can use here?
 type Expression any
-
-func Field(field string) Expression {
-	return "$" + field
-}
 
 type ResolvesToNumber struct {
 	expr Expression
@@ -167,9 +185,9 @@ func (rtn ResolvesToNumber) MarshalBSONValue() (byte, []byte, error) {
 	return byte(typ), b, err
 }
 
-func NumberField(field string) ResolvesToNumber {
+func NumberField(fieldPath string) ResolvesToNumber {
 	return ResolvesToNumber{
-		expr: "$" + field,
+		expr: fieldPath,
 	}
 }
 
@@ -182,9 +200,9 @@ func (rta ResolvesToArray) MarshalBSONValue() (byte, []byte, error) {
 	return byte(typ), b, err
 }
 
-func ArrayField(field string) ResolvesToArray {
+func ArrayField(fieldPath string) ResolvesToArray {
 	return ResolvesToArray{
-		expr: "$" + field,
+		expr: fieldPath,
 	}
 }
 
@@ -192,6 +210,24 @@ func Array[T any](values []T) ResolvesToArray {
 	return ResolvesToArray{
 		expr: values,
 	}
+}
+
+type ResolvesToString struct {
+	expr Expression
+}
+
+func (rts ResolvesToString) MarshalBSONValue() (byte, []byte, error) {
+	typ, b, err := bson.MarshalValue(rts.expr)
+	return byte(typ), b, err
+}
+
+type ResolvesToAny struct {
+	expr Expression
+}
+
+func (rta ResolvesToAny) MarshalBSONValue() (byte, []byte, error) {
+	typ, b, err := bson.MarshalValue(rta.expr)
+	return byte(typ), b, err
 }
 
 type ResolvesToObject struct {
@@ -203,9 +239,9 @@ func (rto ResolvesToObject) MarshalBSONValue() (byte, []byte, error) {
 	return byte(typ), b, err
 }
 
-func ObjectField(field string) ResolvesToObject {
+func ObjectField(fieldPath string) ResolvesToObject {
 	return ResolvesToObject{
-		expr: "$" + field,
+		expr: fieldPath,
 	}
 }
 
@@ -224,33 +260,33 @@ func (rtb ResolvesToBool) MarshalBSONValue() (byte, []byte, error) {
 	return byte(typ), b, err
 }
 
-func Abs[T ResolvesToNumber | Number](value T) ResolvesToNumber {
+func Abs[T NumberTypes](value T) ResolvesToNumber {
 	return ResolvesToNumber{
 		expr: bson.D{{Key: "$abs", Value: value}},
 	}
 }
 
-func BitOr[T ResolvesToNumber | Number](expression T) ResolvesToNumber {
+func BitOr[T NumberTypes](expr T) ResolvesToNumber {
 	return ResolvesToNumber{
-		expr: bson.D{{Key: "$bitOr", Value: expression}},
+		expr: bson.D{{Key: "$bitOr", Value: expr}},
 	}
 }
 
 // TODO: How can we accept a slice of any type here? Is "Array" good enough?
-func Size(expression ResolvesToArray) ResolvesToNumber {
+func Size[T ArrayTypes](expr T) ResolvesToNumber {
 	return ResolvesToNumber{
-		expr: bson.D{{Key: "$size", Value: expression}},
+		expr: bson.D{{Key: "$size", Value: expr}},
 	}
 }
 
-func ArrayToObject(array ResolvesToArray) ResolvesToObject {
+func ArrayToObject[T ArrayTypes](array T) ResolvesToObject {
 	return ResolvesToObject{
 		expr: bson.D{{Key: "$arrayToObject", Value: array}},
 	}
 }
 
 // TODO: How do we do optional params?
-func Zip[T any](inputs []ResolvesToArray, useLongestLength bool, defaults []T) ResolvesToArray {
+func Zip[T ArrayTypes, U any](inputs []T, useLongestLength bool, defaults []U) ResolvesToArray {
 	return ResolvesToArray{
 		expr: bson.D{{Key: "$zip", Value: bson.D{
 			{Key: "inputs", Value: inputs},
@@ -266,7 +302,7 @@ func MergeObjects(document ...ResolvesToObject) ResolvesToObject {
 	}
 }
 
-func Filter(input ResolvesToArray, cond ResolvesToBool, as string) ResolvesToArray {
+func Filter[T ArrayTypes, U BoolTypes](input T, cond U, as string) ResolvesToArray {
 	return ResolvesToArray{
 		expr: bson.D{{Key: "$filter", Value: bson.D{
 			{Key: "input", Value: input},
@@ -276,8 +312,68 @@ func Filter(input ResolvesToArray, cond ResolvesToBool, as string) ResolvesToArr
 	}
 }
 
-func In(expression Expression, array ResolvesToArray) ResolvesToBool {
+func In[T ArrayTypes](expr Expression, array T) ResolvesToBool {
 	return ResolvesToBool{
-		expr: bson.D{{Key: "$in", Value: bson.A{expression, array}}},
+		expr: bson.D{{Key: "$in", Value: bson.A{expr, array}}},
+	}
+}
+
+func AnyElementTrue[T ArrayTypes](array T) ResolvesToBool {
+	return ResolvesToBool{
+		expr: bson.D{{Key: "$anyElementTrue", Value: array}},
+	}
+}
+
+func Add[T NumberTypes](values ...T) ResolvesToNumber {
+	return ResolvesToNumber{
+		expr: bson.D{{Key: "$add", Value: values}},
+	}
+}
+
+func Multiply[T NumberTypes](values ...T) ResolvesToNumber {
+	return ResolvesToNumber{
+		expr: bson.D{{Key: "$multiply", Value: values}},
+	}
+}
+
+func Map[T ArrayTypes, U StringTypes](input T, as U, in Expression) ResolvesToArray {
+	return ResolvesToArray{
+		expr: bson.D{{Key: "$map", Value: bson.D{
+			{Key: "input", Value: input},
+			{Key: "as", Value: as},
+			{Key: "in", Value: in},
+		}}},
+	}
+}
+
+func Reduce[T ArrayTypes](input T, initialValue Expression, in Expression) Expression {
+	return bson.D{{Key: "$reduce", Value: bson.D{
+		{Key: "input", Value: input},
+		{Key: "initialValue", Value: initialValue},
+		{Key: "in", Value: in},
+	}}}
+}
+
+type TruncOption func(*ResolvesToNumber)
+
+func TruncPlace[T NumberTypes](place T) TruncOption {
+	return func(rtn *ResolvesToNumber) {
+		rtn.expr.(bson.D)[0].Value = append(rtn.expr.(bson.D)[0].Value.(bson.A), place)
+	}
+}
+
+func Trunc[T NumberTypes, U NumberTypes](number T, opts ...TruncOption) ResolvesToNumber {
+	rtn := ResolvesToNumber{
+		expr: bson.D{{Key: "$trunc", Value: bson.A{number}}},
+	}
+	for _, opt := range opts {
+		opt(&rtn)
+	}
+	return rtn
+}
+
+func ConcatArrays[T ArrayTypes](arrays ...T) ResolvesToArray {
+	return ResolvesToArray{
+		expr: bson.D{{Key: "$concatArrays", Value: arrays}},
 	}
 }
