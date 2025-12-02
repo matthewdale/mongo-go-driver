@@ -121,6 +121,7 @@ func ConvertCreds(cred *options.Credential) *driver.Cred {
 		Props:               cred.AuthMechanismProperties,
 		OIDCMachineCallback: oidcMachineCallback,
 		OIDCHumanCallback:   oidcHumanCallback,
+		AWSSigner:           cred.AWSSigner,
 	}
 }
 

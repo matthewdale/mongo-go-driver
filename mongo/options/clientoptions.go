@@ -116,6 +116,12 @@ type Credential struct {
 	PasswordSet             bool
 	OIDCMachineCallback     OIDCCallback
 	OIDCHumanCallback       OIDCCallback
+	AWSSigner               AWSSigner
+}
+
+type AWSSigner interface {
+	SignHTTP(ctx context.Context, req *http.Request, body, service, region string, signTime time.Time) error
+	SessionToken(ctx context.Context) (string, error)
 }
 
 // OIDCCallback is the type for both Human and Machine Callback flows.

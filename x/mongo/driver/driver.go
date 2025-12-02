@@ -15,6 +15,7 @@ package driver
 
 import (
 	"context"
+	"net/http"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/internal/csot"
@@ -80,6 +81,12 @@ type Cred struct {
 	Props               map[string]string
 	OIDCMachineCallback OIDCCallback
 	OIDCHumanCallback   OIDCCallback
+	AWSSigner           AWSSigner
+}
+
+type AWSSigner interface {
+	SignHTTP(ctx context.Context, req *http.Request, body, service, region string, signTime time.Time) error
+	SessionToken(ctx context.Context) (string, error)
 }
 
 // Deployment is implemented by types that can select a server from a deployment.

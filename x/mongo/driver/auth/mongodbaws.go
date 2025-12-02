@@ -42,15 +42,23 @@ func newMongoDBAWSAuthenticator(cred *Cred, httpClient *http.Client) (Authentica
 // MongoDBAWSAuthenticator uses AWS-IAM credentials over SASL to authenticate a connection.
 type MongoDBAWSAuthenticator struct {
 	credentials *credproviders.StaticProvider
+	signer      driver.AWSSigner
 	httpClient  *http.Client
 }
 
 // Auth authenticates the connection.
 func (a *MongoDBAWSAuthenticator) Auth(ctx context.Context, cfg *driver.AuthConfig) error {
-	providers := creds.NewAWSCredentialProvider(a.httpClient, a.credentials)
+	signer := a.signer
+	if a.signer == nil {
+		providers := creds.NewAWSCredentialProvider(a.httpClient, a.credentials)
+		signer = &builtInV4Signer{
+			credentials: providers.Cred,
+		}
+	}
+
 	adapter := &awsSaslAdapter{
 		conversation: &awsConversation{
-			credentials: providers.Cred,
+			signer: signer,
 		},
 	}
 	err := ConductSaslConversation(ctx, cfg, sourceExternal, adapter)

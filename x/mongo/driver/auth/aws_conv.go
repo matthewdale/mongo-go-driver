@@ -21,6 +21,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/internal/aws/credentials"
 	v4signer "go.mongodb.org/mongo-driver/v2/internal/aws/signer/v4"
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
 )
 
 type clientState int
@@ -33,10 +34,10 @@ const (
 )
 
 type awsConversation struct {
-	state       clientState
-	valid       bool
-	nonce       []byte
-	credentials *credentials.Credentials
+	state  clientState
+	valid  bool
+	nonce  []byte
+	signer driver.AWSSigner
 }
 
 type serverMessage struct {
@@ -146,7 +147,7 @@ func (ac *awsConversation) finalMsg(s1 []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	creds, err := ac.credentials.GetWithContext(context.Background())
+	sessionToken, err := ac.signer.SessionToken(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -160,17 +161,13 @@ func (ac *awsConversation) finalMsg(s1 []byte) ([]byte, error) {
 	req.Header.Set("Content-Length", "43")
 	req.Host = sm.Host
 	req.Header.Set("X-Amz-Date", currentTime.Format(amzDateFormat))
-	if len(creds.SessionToken) > 0 {
-		req.Header.Set("X-Amz-Security-Token", creds.SessionToken)
+	if len(sessionToken) > 0 {
+		req.Header.Set("X-Amz-Security-Token", sessionToken)
 	}
 	req.Header.Set("X-MongoDB-Server-Nonce", base64.StdEncoding.EncodeToString(sm.Nonce.Data))
 	req.Header.Set("X-MongoDB-GS2-CB-Flag", "n")
 
-	// Create signer with credentials
-	signer := v4signer.NewSigner(ac.credentials)
-
-	// Get signed header
-	_, err = signer.Sign(req, strings.NewReader(body), "sts", region, currentTime)
+	err = ac.signer.SignHTTP(context.Background(), req, body, "sts", region, currentTime)
 	if err != nil {
 		return nil, err
 	}
@@ -179,10 +176,30 @@ func (ac *awsConversation) finalMsg(s1 []byte) ([]byte, error) {
 	idx, msg := bsoncore.AppendDocumentStart(nil)
 	msg = bsoncore.AppendStringElement(msg, "a", req.Header.Get("Authorization"))
 	msg = bsoncore.AppendStringElement(msg, "d", req.Header.Get("X-Amz-Date"))
-	if len(creds.SessionToken) > 0 {
-		msg = bsoncore.AppendStringElement(msg, "t", creds.SessionToken)
+	if len(sessionToken) > 0 {
+		msg = bsoncore.AppendStringElement(msg, "t", sessionToken)
 	}
 	msg, _ = bsoncore.AppendDocumentEnd(msg, idx)
 
 	return msg, nil
+}
+
+var _ driver.AWSSigner = (*builtInV4Signer)(nil)
+
+type builtInV4Signer struct {
+	credentials *credentials.Credentials
+}
+
+func (b *builtInV4Signer) SignHTTP(ctx context.Context, req *http.Request, body, service, region string, signTime time.Time) error {
+	signer := v4signer.NewSigner(b.credentials)
+	_, err := signer.Sign(req, strings.NewReader(body), service, region, signTime)
+	return err
+}
+
+func (b *builtInV4Signer) SessionToken(ctx context.Context) (string, error) {
+	creds, err := b.credentials.GetWithContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	return creds.SessionToken, nil
 }
