@@ -167,7 +167,7 @@ func (ac *awsConversation) finalMsg(s1 []byte) ([]byte, error) {
 	req.Header.Set("X-MongoDB-Server-Nonce", base64.StdEncoding.EncodeToString(sm.Nonce.Data))
 	req.Header.Set("X-MongoDB-GS2-CB-Flag", "n")
 
-	err = ac.signer.SignHTTP(context.Background(), req, body, "sts", region, currentTime)
+	err = ac.signer.Sign(context.Background(), req, body, "sts", region, currentTime)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +190,7 @@ type builtInV4Signer struct {
 	credentials *credentials.Credentials
 }
 
-func (b *builtInV4Signer) SignHTTP(ctx context.Context, req *http.Request, body, service, region string, signTime time.Time) error {
+func (b *builtInV4Signer) Sign(ctx context.Context, req *http.Request, body, service, region string, signTime time.Time) error {
 	signer := v4signer.NewSigner(b.credentials)
 	_, err := signer.Sign(req, strings.NewReader(body), service, region, signTime)
 	return err

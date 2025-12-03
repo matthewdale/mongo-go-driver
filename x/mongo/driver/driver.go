@@ -85,7 +85,7 @@ type Cred struct {
 }
 
 type AWSSigner interface {
-	SignHTTP(ctx context.Context, req *http.Request, body, service, region string, signTime time.Time) error
+	Sign(ctx context.Context, req *http.Request, body, service, region string, signTime time.Time) error
 	SessionToken(ctx context.Context) (string, error)
 }
 
