@@ -7,10 +7,14 @@
 package mongo
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"iter"
+	"log"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1044,4 +1048,186 @@ func newLogger(opts *options.LoggerOptions) (*logger.Logger, error) {
 	}
 
 	return logger.New(opts.Sink, opts.MaxDocumentLength, componentLevels)
+}
+
+func hasDuplicateFields_bsonD(doc bson.D) bool {
+	for i := 0; i < len(doc); i++ {
+		// If the value is an nested bson.D, recurse.
+		if d, ok := doc[i].Value.(bson.D); ok {
+			if hasDuplicateFields_bsonD(d) {
+				return true
+			}
+		}
+		iKey := doc[i].Key
+		for j := i + 1; j < len(doc); j++ {
+			jKey := doc[j].Key
+			if jKey == iKey {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasDuplicateFields_baseline(doc bsoncore.Document) (bool, error) {
+	for typ, name := range documentKeys(doc) {
+		_ = typ
+		_ = name
+	}
+
+	return false, nil
+}
+
+func hasDuplicateFields_map(doc bsoncore.Document) (bool, error) {
+	seen := make(map[string]struct{}, 50)
+	for _, name := range documentKeys(doc) {
+		// TODO: If type is embedded document, recurse. How do we do that from
+		// this iterator?
+		key := string(name)
+		if _, ok := seen[key]; ok {
+			return true, nil
+		}
+		seen[key] = struct{}{}
+	}
+	return false, nil
+}
+
+func hasDuplicateFields_forLoops(doc bsoncore.Document) (bool, error) {
+	names := make([][]byte, 0, 50)
+	for _, name := range documentKeys(doc) {
+		// TODO: If type is embedded document, recurse. How do we do that from
+		// this iterator?
+		names = append(names, name)
+	}
+
+	for i := range names {
+		iKey := names[i]
+		for j := i + 1; j < len(names); j++ {
+			jKey := names[j]
+			if bytes.Equal(jKey, iKey) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func hasDuplicateFields_sort(doc bsoncore.Document) (bool, error) {
+	sortedKeys := make([][]byte, 0, 50)
+	for _, name := range documentKeys(doc) {
+		// TODO: If type is embedded document, recurse. How do we do that from
+		// this iterator?
+		sortedKeys = append(sortedKeys, name)
+	}
+
+	slices.SortFunc(sortedKeys, bytes.Compare)
+
+	for i := 1; i < len(sortedKeys); i++ {
+		if bytes.Equal(sortedKeys[i], sortedKeys[i-1]) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func documentKeys(doc bsoncore.Document) iter.Seq2[bsoncore.Type, []byte] {
+	return func(yield func(bsoncore.Type, []byte) bool) {
+		_, rem, ok := bsoncore.ReadLength(doc)
+		if !ok {
+			log.Panicf("Could not read length from doc: %q", doc)
+		}
+
+		// TODO: Is this the right break condition?
+		for len(rem) > 1 {
+			var typ bsoncore.Type
+			var name []byte
+			var ok bool
+			typ, name, _, rem, ok = ReadElement(rem)
+			if !ok {
+				log.Panicf("Could not read element from rem: %q", rem)
+			}
+
+			if !yield(typ, name) {
+				return
+			}
+		}
+	}
+}
+
+func ReadElement(src []byte) (typ bsoncore.Type, name []byte, val []byte, rem []byte, ok bool) {
+	if len(src) < 1 {
+		return 0, nil, nil, src, false
+	}
+
+	t := bsoncore.Type(src[0])
+
+	// Read the cstring field name.
+	idx := 1
+	for idx < len(src) && src[idx] != 0x00 {
+		idx++
+	}
+	if idx >= len(src) {
+		return 0, nil, nil, src, false
+	}
+
+	idx++ // Move past the null byte
+	length, ok := valueLength(src[idx:], t)
+	if !ok {
+		return 0, nil, nil, src, false
+	}
+	elemLength := idx + int(length)
+	if elemLength > len(src) {
+		return 0, nil, nil, src, false
+	}
+
+	return t, src[1 : idx-1], src[idx-1 : elemLength], src[elemLength:], true
+}
+
+// valueLength will determine the length of the next value contained in src as if it
+// is type t. The returned bool will be false if there are not enough bytes in src for
+// a value of type t.
+func valueLength(src []byte, t bsoncore.Type) (int32, bool) {
+	var length int32
+	ok := true
+	switch t {
+	case bsoncore.TypeArray, bsoncore.TypeEmbeddedDocument, bsoncore.TypeCodeWithScope:
+		length, _, ok = bsoncore.ReadLength(src)
+	case bsoncore.TypeBinary:
+		length, _, ok = bsoncore.ReadLength(src)
+		length += 4 + 1 // binary length + subtype byte
+	case bsoncore.TypeBoolean:
+		length = 1
+	case bsoncore.TypeDBPointer:
+		length, _, ok = bsoncore.ReadLength(src)
+		length += 4 + 12 // string length + ObjectID length
+	case bsoncore.TypeDateTime, bsoncore.TypeDouble, bsoncore.TypeInt64, bsoncore.TypeTimestamp:
+		length = 8
+	case bsoncore.TypeDecimal128:
+		length = 16
+	case bsoncore.TypeInt32:
+		length = 4
+	case bsoncore.TypeJavaScript, bsoncore.TypeString, bsoncore.TypeSymbol:
+		length, _, ok = bsoncore.ReadLength(src)
+		length += 4
+	case bsoncore.TypeMaxKey, bsoncore.TypeMinKey, bsoncore.TypeNull, bsoncore.TypeUndefined:
+		length = 0
+	case bsoncore.TypeObjectID:
+		length = 12
+	case bsoncore.TypeRegex:
+		regex := bytes.IndexByte(src, 0x00)
+		if regex < 0 {
+			ok = false
+			break
+		}
+		pattern := bytes.IndexByte(src[regex+1:], 0x00)
+		if pattern < 0 {
+			ok = false
+			break
+		}
+		length = int32(int64(regex) + 1 + int64(pattern) + 1)
+	default:
+		ok = false
+	}
+
+	return length, ok
 }

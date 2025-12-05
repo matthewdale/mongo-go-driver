@@ -9,6 +9,7 @@ package mongo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"testing"
@@ -24,6 +25,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 	"go.mongodb.org/mongo-driver/v2/tag"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/mongocrypt"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/topology"
 )
@@ -514,4 +516,173 @@ func TestClient(t *testing.T) {
 		errmsg := `invalid value "-1s" for "Timeout": value must be positive`
 		assert.Equal(t, errmsg, err.Error(), "expected error %v, got %v", errmsg, err.Error())
 	})
+}
+
+func TestDocumentKeys(t *testing.T) {
+	doc := mustMarshalBSON(bson.D{
+		{"one", 1},
+		{"two", 2},
+		{"three", 3},
+		{"four", 4},
+	})
+
+	for typ, key := range documentKeys(doc) {
+		fmt.Println(bsoncore.Type(typ), string(key))
+	}
+
+	t.Error("blah")
+}
+
+// Results on my laptop. The nested for loop O(n^2) approach seems the best for documents with up to 25 fields:
+//
+// Running tool: /usr/local/go/bin/go test -benchmem -run=^$ -bench ^BenchmarkHasDuplicateFields$ go.mongodb.org/mongo-driver/v2/mongo
+//
+// goos: darwin
+// goarch: arm64
+// pkg: go.mongodb.org/mongo-driver/v2/mongo
+// cpu: Apple M1 Max
+// BenchmarkHasDuplicateFields/no_duplicates/baseline-10         	36386002	        32.84 ns/op	       0 B/op	       0 allocs/op
+// BenchmarkHasDuplicateFields/no_duplicates/bsonD-10            	54778782	        21.54 ns/op	       0 B/op	       0 allocs/op
+// BenchmarkHasDuplicateFields/no_duplicates/map-10              	 2764308	       437.6 ns/op	    1853 B/op	       8 allocs/op
+// BenchmarkHasDuplicateFields/no_duplicates/forLoops-10         	15749641	        76.30 ns/op	       0 B/op	       0 allocs/op
+// BenchmarkHasDuplicateFields/no_duplicates/sort-10             	10624992	       113.6 ns/op	       0 B/op	       0 allocs/op
+// BenchmarkHasDuplicateFields/with_duplicates/baseline-10       	35375446	        33.93 ns/op	       0 B/op	       0 allocs/op
+// BenchmarkHasDuplicateFields/with_duplicates/bsonD-10          	71563993	        16.68 ns/op	       0 B/op	       0 allocs/op
+// BenchmarkHasDuplicateFields/with_duplicates/map-10            	 2825738	       441.8 ns/op	    1853 B/op	       8 allocs/op
+// BenchmarkHasDuplicateFields/with_duplicates/forLoops-10       	15850633	        75.19 ns/op	       0 B/op	       0 allocs/op
+// BenchmarkHasDuplicateFields/with_duplicates/sort-10           	 9232074	       116.1 ns/op	       0 B/op	       0 allocs/op
+// BenchmarkHasDuplicateFields/with_duplicates,_many_fields/baseline-10         	 7232008	       168.3 ns/op	       0 B/op	       0 allocs/op
+// BenchmarkHasDuplicateFields/with_duplicates,_many_fields/bsonD-10            	 5647903	       216.1 ns/op	       0 B/op	       0 allocs/op
+// BenchmarkHasDuplicateFields/with_duplicates,_many_fields/map-10              	 1000000	      1064 ns/op	    2024 B/op	      28 allocs/op
+// BenchmarkHasDuplicateFields/with_duplicates,_many_fields/forLoops-10         	 2889972	       421.1 ns/op	       0 B/op	       0 allocs/op
+// BenchmarkHasDuplicateFields/with_duplicates,_many_fields/sort-10             	 1371498	       825.5 ns/op	       0 B/op	       0 allocs/op
+// PASS
+// ok  	go.mongodb.org/mongo-driver/v2/mongo	18.283s
+
+func BenchmarkHasDuplicateFields(b *testing.B) {
+	var cases = []struct {
+		name string
+		doc  bson.D
+		want bool
+	}{
+		{
+			name: "no duplicates",
+			doc: bson.D{
+				{"one", 1},
+				{"two", 2},
+				{"three", 3},
+				{"four", "onetwothreefour"},
+				{"five", 5},
+			},
+			want: false,
+		},
+		{
+			name: "with duplicates",
+			doc: bson.D{
+				{"one", 1},
+				{"two", 2},
+				{"three", 3},
+				{"four", "onetwothreefour"},
+				{"four", "onetwothreefour"},
+			},
+			want: true,
+		},
+		{
+			name: "with duplicates, many fields",
+			doc: bson.D{
+				{"one", 1},
+				{"two", 2},
+				{"three", 3},
+				{"four", "onetwothreefour"},
+				{"five", 5},
+				{"six", 6},
+				{"seven", 7},
+				{"eight", 8},
+				{"nine", 9},
+				{"ten", 10},
+				{"eleven", 11},
+				{"twelve", 12},
+				{"thirteen", 13},
+				{"fourteen", 14},
+				{"fifteen", 15},
+				{"sixteen", 16},
+				{"seventeen", 17},
+				{"eighteen", 18},
+				{"nineteen", "onetwothreefourfivesixseveneightnineteneleventwelvethirteenfourteenfifteensixteenseventeeneighteennineteen"},
+				{"twenty", 20},
+				{"twentyone", 21},
+				{"twentytwo", 22},
+				{"twentythree", 23},
+				{"twentyfour", 24},
+				{"twentyfour", 24},
+			},
+			want: true,
+		},
+	}
+
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			b.Run("baseline", func(b *testing.B) {
+				doc := mustMarshalBSON(c.doc)
+				for b.Loop() {
+					_, err := hasDuplicateFields_baseline(doc)
+					if err != nil {
+						b.Fatalf("hasDuplicateFields1() error: %v", err)
+					}
+				}
+			})
+			b.Run("bsonD", func(b *testing.B) {
+				for b.Loop() {
+					got := hasDuplicateFields_bsonD(c.doc)
+					if got != c.want {
+						b.Errorf("hasDuplicateFields1() = %v; want %v", got, c.want)
+					}
+				}
+			})
+			b.Run("map", func(b *testing.B) {
+				doc := mustMarshalBSON(c.doc)
+				for b.Loop() {
+					got, err := hasDuplicateFields_map(doc)
+					if err != nil {
+						b.Fatalf("hasDuplicateFields1() error: %v", err)
+					}
+					if got != c.want {
+						b.Fatalf("hasDuplicateFields1() = %v; want %v", got, c.want)
+					}
+				}
+			})
+			b.Run("forLoops", func(b *testing.B) {
+				doc := mustMarshalBSON(c.doc)
+				for b.Loop() {
+					got, err := hasDuplicateFields_forLoops(doc)
+					if err != nil {
+						b.Fatalf("hasDuplicateFields1() error: %v", err)
+					}
+					if got != c.want {
+						b.Fatalf("hasDuplicateFields1() = %v; want %v", got, c.want)
+					}
+				}
+			})
+			b.Run("sort", func(b *testing.B) {
+				doc := mustMarshalBSON(c.doc)
+				for b.Loop() {
+					got, err := hasDuplicateFields_sort(doc)
+					if err != nil {
+						b.Fatalf("hasDuplicateFields1() error: %v", err)
+					}
+					if got != c.want {
+						b.Fatalf("hasDuplicateFields1() = %v; want %v", got, c.want)
+					}
+				}
+			})
+		})
+	}
+}
+
+func mustMarshalBSON(v any) bsoncore.Document {
+	data, err := bson.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return data
 }
