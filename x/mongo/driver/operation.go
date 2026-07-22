@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +23,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/internal/driverutil"
 	"go.mongodb.org/mongo-driver/v2/internal/handshake"
 	"go.mongodb.org/mongo-driver/v2/internal/logger"
+	"go.mongodb.org/mongo-driver/v2/internal/observability"
 	"go.mongodb.org/mongo-driver/v2/internal/randutil"
 	"go.mongodb.org/mongo-driver/v2/internal/serverselector"
 	"go.mongodb.org/mongo-driver/v2/mongo/address"
@@ -35,6 +35,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/mnet"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/session"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/wiremessage"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -355,6 +356,10 @@ type Operation struct {
 	// CommandMonitor specifies the monitor to use for APM events. If this field is not set,
 	// no events will be reported.
 	CommandMonitor *event.CommandMonitor
+
+	// Tracer specifies the tracer to use for recording OpenTelemetry spans. If
+	// this field is not set, no spans are recorded.
+	Tracer trace.Tracer
 
 	// Crypt specifies a Crypt object to use for automatic in-use encryption and decryption.
 	Crypt Crypt
@@ -786,7 +791,11 @@ func (op Operation) Execute(ctx context.Context) error {
 		startedInfo.serverConnID = conn.ServerConnectionID()
 		startedInfo.serverAddress = conn.Description().Addr
 
-		op.publishStartedEvent(ctx, startedInfo)
+		// The command span is created per attempt, so retries and batch splits
+		// each get their own span nested under the operation span. cmdCtx
+		// carries the command span; the loop's ctx is deliberately left alone so
+		// that the next attempt's span is a sibling rather than a child.
+		cmdCtx, span := op.publishStartedEvent(ctx, startedInfo)
 
 		// compress wiremessage if allowed
 		if compressor := conn.Compressor; compressor != nil && op.canCompress(startedInfo.cmdName) {
@@ -795,6 +804,8 @@ func (op Operation) Execute(ctx context.Context) error {
 			memoryPool.Put(wm)
 			wm = b
 			if err != nil {
+				span.End()
+
 				return err
 			}
 		}
@@ -830,7 +841,7 @@ func (op Operation) Execute(ctx context.Context) error {
 			if moreToCome {
 				roundTrip = op.moreToComeRoundTrip
 			}
-			res, err = roundTrip(ctx, conn, *wm)
+			res, err = roundTrip(cmdCtx, conn, *wm)
 
 			if ep, ok := srvr.(ErrorProcessor); ok {
 				_ = ep.ProcessError(err, conn)
@@ -841,7 +852,7 @@ func (op Operation) Execute(ctx context.Context) error {
 		finishedInfo.cmdErr = err
 		finishedInfo.duration = time.Since(startedTime)
 
-		op.publishFinishedEvent(ctx, finishedInfo)
+		op.publishFinishedEvent(ctx, span, finishedInfo)
 
 		// prevIndefiniteErrorIsSet is "true" if the "err" variable has been set to the "prevIndefiniteErr" in
 		// a case in the switch statement below.
@@ -1453,7 +1464,8 @@ func (op Operation) createWireMessage(
 			dst, info.cmd, err = op.createMsgWireMessage(ctx, maxTimeMS, dst, desc, conn, op.CommandFn)
 			if err == nil && op.Batches != nil {
 				batchOffset = len(dst)
-				info.processedBatches, dst, err = op.Batches.AppendBatchSequence(dst,
+				info.processedBatches, dst, err = op.Batches.AppendBatchSequence(
+					dst,
 					int(desc.MaxBatchCount), int(desc.MaxMessageSize),
 				)
 				if err != nil {
@@ -1466,7 +1478,8 @@ func (op Operation) createWireMessage(
 		default:
 			var batches []byte
 			if op.Batches != nil {
-				info.processedBatches, batches, err = op.Batches.AppendBatchSequence(batches,
+				info.processedBatches, batches, err = op.Batches.AppendBatchSequence(
+					batches,
 					int(desc.MaxBatchCount), int(desc.MaxMessageSize),
 				)
 				if err != nil {
@@ -1811,7 +1824,8 @@ func (op Operation) calculateMaxTimeMS(ctx context.Context, rttMin time.Duration
 			"calculated server-side timeout (%v ms) is less than or equal to 0 (%v): %w",
 			maxTimeMS,
 			rttStats,
-			ErrDeadlineWouldBeExceeded)
+			ErrDeadlineWouldBeExceeded,
+		)
 	}
 
 	return maxTimeMS, nil
@@ -2136,150 +2150,154 @@ func (op *Operation) redactCommand(cmd string, doc bsoncore.Document) bool {
 	return err == nil
 }
 
-// canLogCommandMessage returns true if the command can be logged.
-func (op Operation) canLogCommandMessage() bool {
-	return op.Logger != nil && op.Logger.LevelComponentEnabled(logger.LevelDebug, logger.ComponentCommand)
-}
-
-func (op Operation) canPublishStartedEvent() bool {
-	return op.CommandMonitor != nil && op.CommandMonitor.Started != nil
-}
-
-// publishStartedEvent publishes a CommandStartedEvent to the operation's command monitor if possible. If the command is
-// an unacknowledged write, a CommandSucceededEvent will be published as well. If started events are not being monitored,
-// no events are published.
-func (op Operation) publishStartedEvent(ctx context.Context, info startedInformation) {
-	// If logging is enabled for the command component at the debug level, log the command response.
-	if op.canLogCommandMessage() {
-		host, port, _ := net.SplitHostPort(info.serverAddress.String())
-
-		redactedCmd := redactStartedInformationCmd(info)
-		formattedCmd := logger.FormatDocument(redactedCmd, op.Logger.MaxDocumentLength)
-
-		op.Logger.Print(logger.LevelDebug,
-			logger.ComponentCommand,
-			logger.CommandStarted,
-			logger.SerializeCommand(logger.Command{
-				DriverConnectionID: info.driverConnectionID,
-				Message:            logger.CommandStarted,
-				Name:               info.cmdName,
-				DatabaseName:       op.Database,
-				RequestID:          int64(info.requestID),
-				ServerConnectionID: info.serverConnID,
-				ServerHost:         host,
-				ServerPort:         port,
-				ServiceID:          info.serviceID,
-			},
-				logger.KeyCommand, formattedCmd)...)
-
-	}
-
-	if op.canPublishStartedEvent() {
-		started := &event.CommandStartedEvent{
-			Command:            redactStartedInformationCmd(info),
-			DatabaseName:       op.Database,
-			CommandName:        info.cmdName,
-			RequestID:          int64(info.requestID),
-			ConnectionID:       info.connID,
-			ServerConnectionID: info.serverConnID,
-			ServiceID:          info.serviceID,
-		}
-		op.CommandMonitor.Started(ctx, started)
+// observer returns the Observer that fans command lifecycle moments out to the
+// command monitor, the logger, and the tracer.
+func (op Operation) observer() observability.Observer {
+	return observability.Observer{
+		CommandMonitor: op.CommandMonitor,
+		Logger:         op.Logger,
+		Tracer:         op.Tracer,
 	}
 }
 
-// canPublishFinishedEvent returns true if a CommandSucceededEvent can be
-// published for the given command. This is true if the command is not an
-// unacknowledged write and the command monitor is monitoring succeeded events.
-func (op Operation) canPublishFinishedEvent(info finishedInformation) bool {
-	success := info.success()
+// collectionFromCommand returns the collection a command targets, or an empty
+// string if the command does not target a collection.
+//
+// For commands executed against a collection, the value of the command
+// document's first element -- the one keyed by the command name -- is the
+// collection name. For database-level commands it is something else, typically
+// the number 1 (e.g. "listCollections: 1"), so the value is only used when it
+// is a string.
+func collectionFromCommand(cmd bsoncore.Document, cmdName string) string {
+	val, err := cmd.LookupErr(cmdName)
+	if err != nil {
+		return ""
+	}
 
-	return op.CommandMonitor != nil &&
-		(!success || op.CommandMonitor.Succeeded != nil) &&
-		(success || op.CommandMonitor.Failed != nil)
+	coll, ok := val.StringValueOK()
+	if !ok {
+		return ""
+	}
+
+	return coll
 }
 
-// publishFinishedEvent publishes either a CommandSucceededEvent or a CommandFailedEvent to the operation's command
-// monitor if possible. If success/failure events aren't being monitored, no events are published.
-func (op Operation) publishFinishedEvent(ctx context.Context, info finishedInformation) {
-	if op.canLogCommandMessage() && info.success() {
-		host, port, _ := net.SplitHostPort(info.serverAddress.String())
-
-		redactedReply := redactFinishedInformationResponse(info)
-
-		formattedReply := logger.FormatDocument(redactedReply, op.Logger.MaxDocumentLength)
-
-		op.Logger.Print(logger.LevelDebug,
-			logger.ComponentCommand,
-			logger.CommandSucceeded,
-			logger.SerializeCommand(logger.Command{
-				DriverConnectionID: info.driverConnectionID,
-				Message:            logger.CommandSucceeded,
-				Name:               info.cmdName,
-				DatabaseName:       op.Database,
-				RequestID:          int64(info.requestID),
-				ServerConnectionID: info.serverConnID,
-				ServerHost:         host,
-				ServerPort:         port,
-				ServiceID:          info.serviceID,
-			},
-				logger.KeyDurationMS, info.duration.Milliseconds(),
-				logger.KeyReply, formattedReply)...)
+// networkTransport reports the transport an address is reached over, as one of
+// the values allowed for the "network.transport" attribute.
+func networkTransport(addr address.Address) string {
+	if strings.HasSuffix(strings.ToLower(string(addr)), ".sock") {
+		return observability.TransportUnix
 	}
 
-	if op.canLogCommandMessage() && !info.success() {
-		host, port, _ := net.SplitHostPort(info.serverAddress.String())
+	return observability.TransportTCP
+}
 
-		formattedReply := logger.FormatString(info.cmdErr.Error(), op.Logger.MaxDocumentLength)
-
-		op.Logger.Print(logger.LevelDebug,
-			logger.ComponentCommand,
-			logger.CommandFailed,
-			logger.SerializeCommand(logger.Command{
-				DriverConnectionID: info.driverConnectionID,
-				Message:            logger.CommandFailed,
-				Name:               info.cmdName,
-				DatabaseName:       op.Database,
-				RequestID:          int64(info.requestID),
-				ServerConnectionID: info.serverConnID,
-				ServerHost:         host,
-				ServerPort:         port,
-				ServiceID:          info.serviceID,
-			},
-				logger.KeyDurationMS, info.duration.Milliseconds(),
-				logger.KeyFailure, formattedReply)...)
+// lsid returns the session's logical session ID formatted as a canonical UUID
+// string, or an empty string if there is no session.
+func (op Operation) lsid() string {
+	if op.Client == nil || op.Client.Server == nil {
+		return ""
 	}
 
-	// If the finished event cannot be published, return early.
-	if !op.canPublishFinishedEvent(info) {
-		return
+	val, err := op.Client.SessionID.LookupErr("id")
+	if err != nil {
+		return ""
 	}
 
-	finished := event.CommandFinishedEvent{
+	_, data, ok := val.BinaryOK()
+	if !ok || len(data) != 16 {
+		return ""
+	}
+
+	return fmt.Sprintf("%x-%x-%x-%x-%x", data[0:4], data[4:6], data[6:8], data[8:10], data[10:16])
+}
+
+// txnNumber returns the current transaction number, or nil if the operation is
+// not part of a transaction.
+func (op Operation) txnNumber() *int64 {
+	if op.Client == nil || op.Client.Server == nil {
+		return nil
+	}
+	if !op.Client.TransactionRunning() && !op.Client.Committing && !op.Client.Aborting {
+		return nil
+	}
+
+	txnNumber := op.Client.TxnNumber
+
+	return &txnNumber
+}
+
+// statusCode returns the MongoDB error code for err as a string, or an empty
+// string if err carries no MongoDB error code.
+func statusCode(err error) string {
+	var cmdErr Error
+	if errors.As(err, &cmdErr) {
+		return strconv.FormatInt(int64(cmdErr.Code), 10)
+	}
+
+	return ""
+}
+
+// commandStartedInfo maps the driver's internal started information onto the
+// payload the Observer fans out. The command is redacted here, once, rather
+// than once per sink.
+func (op Operation) commandStartedInfo(info startedInformation) observability.CommandStartedInfo {
+	return observability.CommandStartedInfo{
+		Command:            redactStartedInformationCmd(info),
+		CommandName:        info.cmdName,
+		DatabaseName:       op.Database,
+		CollectionName:     collectionFromCommand(info.cmd, info.cmdName),
+		RequestID:          int64(info.requestID),
+		ConnectionID:       info.connID,
+		DriverConnectionID: info.driverConnectionID,
+		ServerConnectionID: info.serverConnID,
+		ServiceID:          info.serviceID,
+		ServerAddress:      info.serverAddress.String(),
+		NetworkTransport:   networkTransport(info.serverAddress),
+		LSID:               op.lsid(),
+		TxnNumber:          op.txnNumber(),
+		Sensitive:          info.redacted,
+	}
+}
+
+// publishStartedEvent starts the command span, publishes a CommandStartedEvent,
+// and writes the "command started" log message. The returned span must be
+// passed to publishFinishedEvent, and the returned context carries it.
+func (op Operation) publishStartedEvent(
+	ctx context.Context,
+	info startedInformation,
+) (context.Context, trace.Span) {
+	return op.observer().CommandStarted(ctx, op.commandStartedInfo(info))
+}
+
+// publishFinishedEvent ends the command span and publishes either a
+// CommandSucceededEvent or a CommandFailedEvent along with the corresponding
+// log message.
+func (op Operation) publishFinishedEvent(
+	ctx context.Context,
+	span trace.Span,
+	info finishedInformation,
+) {
+	started := observability.CommandStartedInfo{
 		CommandName:        info.cmdName,
 		DatabaseName:       op.Database,
 		RequestID:          int64(info.requestID),
 		ConnectionID:       info.connID,
-		Duration:           info.duration,
+		DriverConnectionID: info.driverConnectionID,
 		ServerConnectionID: info.serverConnID,
 		ServiceID:          info.serviceID,
+		ServerAddress:      info.serverAddress.String(),
+		Sensitive:          info.redacted,
 	}
 
-	if info.success() {
-		successEvent := &event.CommandSucceededEvent{
-			Reply:                redactFinishedInformationResponse(info),
-			CommandFinishedEvent: finished,
-		}
-		op.CommandMonitor.Succeeded(ctx, successEvent)
-
-		return
-	}
-
-	failedEvent := &event.CommandFailedEvent{
-		Failure:              info.cmdErr,
-		CommandFinishedEvent: finished,
-	}
-	op.CommandMonitor.Failed(ctx, failedEvent)
+	op.observer().CommandFinished(ctx, span, observability.CommandFinishedInfo{
+		CommandStartedInfo: started,
+		Duration:           info.duration,
+		Reply:              redactFinishedInformationResponse(info),
+		Err:                info.cmdErr,
+		StatusCode:         statusCode(info.cmdErr),
+		Success:            info.success(),
+	})
 }
 
 // overloadBackoff returns the exponential backoff duration for the given overload retry attempt.

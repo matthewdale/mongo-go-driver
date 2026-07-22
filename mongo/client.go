@@ -21,6 +21,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/internal/httputil"
 	"go.mongodb.org/mongo-driver/v2/internal/logger"
 	"go.mongodb.org/mongo-driver/v2/internal/mongoutil"
+	"go.mongodb.org/mongo-driver/v2/internal/observability"
 	"go.mongodb.org/mongo-driver/v2/internal/optionsutil"
 	"go.mongodb.org/mongo-driver/v2/internal/ptrutil"
 	"go.mongodb.org/mongo-driver/v2/internal/serverselector"
@@ -29,6 +30,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/v2/version"
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/auth"
@@ -37,6 +39,7 @@ import (
 	mcopts "go.mongodb.org/mongo-driver/v2/x/mongo/driver/mongocrypt/options"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/session"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/topology"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -75,6 +78,8 @@ type Client struct {
 	monitor                   *event.CommandMonitor
 	serverAPI                 *driver.ServerAPIOptions
 	serverMonitor             *event.ServerMonitor
+	tracer                    trace.Tracer
+	observer                  observability.Observer
 	sessionPool               *session.Pool
 	timeout                   *time.Duration
 	httpClient                *http.Client
@@ -161,6 +166,15 @@ func newClient(opts ...*options.ClientOptions) (*Client, error) {
 	if clientOpts.ServerMonitor != nil {
 		client.serverMonitor = clientOpts.ServerMonitor
 	}
+	// TracerProvider. The OpenTelemetry specification requires the tracer to be
+	// named after the driver and versioned with the same string the handshake
+	// reports as "client.driver.version".
+	if clientOpts.TracerProvider != nil {
+		client.tracer = clientOpts.TracerProvider.Tracer(
+			"go.mongodb.org/mongo-driver/v2",
+			trace.WithInstrumentationVersion(version.Driver),
+		)
+	}
 	// ReadConcern
 	client.readConcern = &readconcern.ReadConcern{}
 	if clientOpts.ReadConcern != nil {
@@ -235,7 +249,8 @@ func newClient(opts ...*options.ClientOptions) (*Client, error) {
 		client.AppendDriverInfo(*clientOpts.DriverInfo)
 	}
 
-	cfg, err := topology.NewAuthenticatorConfig(client.authenticator,
+	cfg, err := topology.NewAuthenticatorConfig(
+		client.authenticator,
 		topology.WithAuthConfigClock(client.clock),
 		topology.WithAuthConfigClientOptions(clientOpts),
 		topology.WithAuthConfigDriverInfo(client.currentDriverInfo),
@@ -262,6 +277,14 @@ func newClient(opts ...*options.ClientOptions) (*Client, error) {
 	client.logger, err = newLogger(clientOpts.LoggerOptions)
 	if err != nil {
 		return nil, fmt.Errorf("invalid logger options: %w", err)
+	}
+
+	// Bundle the observability sinks so that operations emit events, log
+	// messages, and spans through a single fan-out point.
+	client.observer = observability.Observer{
+		CommandMonitor: client.monitor,
+		Logger:         client.logger,
+		Tracer:         client.tracer,
 	}
 
 	return client, nil
@@ -654,7 +677,8 @@ func (c *Client) newMongoCrypt(opts *options.AutoEncryptionOptions) (*mongocrypt
 		str, ok := val.(string)
 		if !ok {
 			return nil, fmt.Errorf(
-				`expected AutoEncryption extra option "cryptSharedLibPath" to be a string, but is a %T`, val)
+				`expected AutoEncryption extra option "cryptSharedLibPath" to be a string, but is a %T`, val,
+			)
 		}
 		cryptSharedLibPath = str
 	}
@@ -693,7 +717,8 @@ func (c *Client) newMongoCrypt(opts *options.AutoEncryptionOptions) (*mongocrypt
 		b, ok := val.(bool)
 		if !ok {
 			return nil, fmt.Errorf(
-				`expected AutoEncryption extra option "cryptSharedLibRequired" to be a bool, but is a %T`, val)
+				`expected AutoEncryption extra option "cryptSharedLibRequired" to be a bool, but is a %T`, val,
+			)
 		}
 		cryptSharedLibRequired = b
 	}
@@ -703,7 +728,8 @@ func (c *Client) newMongoCrypt(opts *options.AutoEncryptionOptions) (*mongocrypt
 	// return an error indicating that we couldn't load the crypt_shared library.
 	if cryptSharedLibRequired && mc.CryptSharedLibVersionString() == "" {
 		return nil, errors.New(
-			`AutoEncryption extra option "cryptSharedLibRequired" is true, but we failed to load the crypt_shared library`)
+			`AutoEncryption extra option "cryptSharedLibRequired" is true, but we failed to load the crypt_shared library`,
+		)
 	}
 
 	return mc, nil
