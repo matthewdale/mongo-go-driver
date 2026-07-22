@@ -26,10 +26,12 @@ import (
 	"go.mongodb.org/mongo-driver/v2/internal/logger"
 	"go.mongodb.org/mongo-driver/v2/internal/randutil"
 	"go.mongodb.org/mongo-driver/v2/internal/serverselector"
+	"go.mongodb.org/mongo-driver/v2/internal/telemetryutil"
 	"go.mongodb.org/mongo-driver/v2/mongo/address"
 	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/v2/telemetry"
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/mnet"
@@ -358,6 +360,12 @@ type Operation struct {
 	// no events will be reported.
 	CommandMonitor *event.CommandMonitor
 
+	// Tracer specifies the tracer used to create spans for this operation. If
+	// this field is nil, no spans will be created.
+	//
+	// Tracing is experimental. See the telemetry package documentation.
+	Tracer telemetry.Tracer
+
 	// Crypt specifies a Crypt object to use for automatic in-use encryption and decryption.
 	Crypt Crypt
 
@@ -407,9 +415,33 @@ func (op Operation) selectServer(
 	ctx context.Context,
 	requestID int32,
 	deprioritized []description.Server,
-) (Server, error) {
+) (_ Server, err error) {
+	// Validate before starting the span. Otherwise an invalid operation is
+	// reported as a server selection failure, which it is not.
 	if err := op.Validate(); err != nil {
 		return nil, err
+	}
+
+	if op.tracer().Enabled(ctx) {
+		attrs := []telemetry.Attr{
+			telemetryutil.DBSystemName,
+			telemetry.String(telemetryutil.AttrDBNamespace, op.Database),
+			telemetry.String(telemetryutil.AttrDBOperationName, op.Name),
+		}
+		if len(deprioritized) > 0 {
+			attrs = append(attrs,
+				telemetry.Int(telemetryutil.AttrDeprioritizedCount, len(deprioritized)))
+		}
+
+		var span telemetry.Span
+
+		ctx, span = op.tracer().StartSpan(ctx, telemetryutil.SpanServerSelection, attrs...)
+
+		// The address of the selected server is not recorded here: the driver.Server
+		// interface does not expose it. It is recorded on the connection checkout
+		// span instead, which is this span's immediate sibling and has the
+		// connection in hand.
+		defer func() { span.End(err) }()
 	}
 
 	selector := op.Selector
@@ -441,7 +473,7 @@ func (op Operation) getServerAndConnection(
 	ctx context.Context,
 	requestID int32,
 	deprioritized []description.Server,
-) (Server, *mnet.Connection, error) {
+) (_ Server, _ *mnet.Connection, err error) {
 	ctx, cancel := csot.WithServerSelectionTimeout(ctx, op.Deployment.GetServerSelectionTimeout())
 	defer cancel()
 
@@ -458,10 +490,23 @@ func (op Operation) getServerAndConnection(
 		return nil, nil, err
 	}
 
+	// The checkout span is started before the pinned-connection branch below, so
+	// that pinned checkouts -- every operation in a transaction against a load
+	// balancer -- are represented in the trace rather than silently missing.
+	span := telemetry.NoopSpan()
+	if op.tracer().Enabled(ctx) {
+		ctx, span = op.tracer().StartSpan(ctx, telemetryutil.SpanConnectionCheckout)
+
+		defer func() { span.End(err) }()
+	}
+
 	// If the provided client session has a pinned connection, it should be used for the operation because this
 	// indicates that we're in a transaction and the target server is behind a load balancer.
 	if op.Client != nil && op.Client.PinnedConnection != nil {
 		conn := mnet.NewConnection(op.Client.PinnedConnection)
+
+		span.SetAttributes(op.connectionAttrs(conn, true)...)
+
 		return server, conn, nil
 	}
 
@@ -470,6 +515,8 @@ func (op Operation) getServerAndConnection(
 	if err != nil {
 		return nil, nil, err
 	}
+
+	span.SetAttributes(op.connectionAttrs(conn, false)...)
 
 	// If we're in load balanced mode and this is the first operation in a transaction, pin the session to a connection.
 	if driverutil.IsServerLoadBalanced(conn.Description()) && op.Client != nil && op.Client.TransactionStarting() {
@@ -487,6 +534,36 @@ func (op Operation) getServerAndConnection(
 	}
 
 	return server, conn, nil
+}
+
+// tracer returns the operation's tracer, substituting the no-op tracer when
+// none is set.
+//
+// Operation is an exported struct that callers construct directly, and its
+// methods are reachable without going through Execute, so op.Tracer may be nil
+// at any span site. Always reach the tracer through this method rather than
+// touching op.Tracer: calling a method on a nil interface panics.
+func (op Operation) tracer() telemetry.Tracer {
+	if op.Tracer == nil {
+		return telemetry.Noop()
+	}
+
+	return op.Tracer
+}
+
+// connectionAttrs builds the span attributes describing a checked-out
+// connection. It is only called when a tracer is enabled, so it is free to
+// allocate.
+func (op Operation) connectionAttrs(conn *mnet.Connection, pinned bool) []telemetry.Attr {
+	attrs := make([]telemetry.Attr, 0, 4)
+	attrs = telemetryutil.ServerAddress(attrs, conn.Description().Addr)
+	attrs = append(attrs, telemetry.Bool(telemetryutil.AttrPinnedConnection, pinned))
+
+	if id := conn.ServerConnectionID(); id != nil {
+		attrs = append(attrs, telemetry.Int64(telemetryutil.AttrServerConnectionID, *id))
+	}
+
+	return attrs
 }
 
 // Validate validates this operation, ensuring the fields are set properly.
@@ -1457,7 +1534,8 @@ func (op Operation) createWireMessage(
 			dst, info.cmd, err = op.createMsgWireMessage(ctx, maxTimeMS, dst, desc, conn, op.CommandFn)
 			if err == nil && op.Batches != nil {
 				batchOffset = len(dst)
-				info.processedBatches, dst, err = op.Batches.AppendBatchSequence(dst,
+				info.processedBatches, dst, err = op.Batches.AppendBatchSequence(
+					dst,
 					int(desc.MaxBatchCount), int(desc.MaxMessageSize),
 				)
 				if err != nil {
@@ -1470,7 +1548,8 @@ func (op Operation) createWireMessage(
 		default:
 			var batches []byte
 			if op.Batches != nil {
-				info.processedBatches, batches, err = op.Batches.AppendBatchSequence(batches,
+				info.processedBatches, batches, err = op.Batches.AppendBatchSequence(
+					batches,
 					int(desc.MaxBatchCount), int(desc.MaxMessageSize),
 				)
 				if err != nil {
@@ -1815,7 +1894,8 @@ func (op Operation) calculateMaxTimeMS(ctx context.Context, rttMin time.Duration
 			"calculated server-side timeout (%v ms) is less than or equal to 0 (%v): %w",
 			maxTimeMS,
 			rttStats,
-			ErrDeadlineWouldBeExceeded)
+			ErrDeadlineWouldBeExceeded,
+		)
 	}
 
 	return maxTimeMS, nil

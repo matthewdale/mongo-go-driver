@@ -60,6 +60,34 @@ func compareErrors(err1, err2 error) bool {
 func TestOperation(t *testing.T) {
 	int64ToPtr := func(i64 int64) *int64 { return &i64 }
 
+	t.Run("nil Tracer", func(t *testing.T) {
+		// Operation is exported and constructed directly by callers, most of
+		// which never set Tracer. Calling a method on a nil interface panics, so
+		// every span site must reach the tracer through Operation.tracer.
+		t.Run("tracer returns a usable no-op tracer", func(t *testing.T) {
+			op := Operation{}
+
+			tracer := op.tracer()
+			if tracer == nil {
+				t.Fatal("Expected a non-nil tracer, but got <nil>")
+			}
+			if tracer.Enabled(context.Background()) {
+				t.Error("Expected the substituted tracer to be disabled")
+			}
+		})
+		t.Run("selectServer does not panic", func(t *testing.T) {
+			d := new(mockDeployment)
+			op := &Operation{
+				CommandFn:  func([]byte, description.SelectedServer) ([]byte, error) { return nil, nil },
+				Deployment: d,
+				Database:   "testing",
+			}
+
+			_, err := op.selectServer(context.Background(), 1, nil)
+			noerr(t, err)
+		})
+	})
+
 	t.Run("selectServer", func(t *testing.T) {
 		t.Run("returns validation error", func(t *testing.T) {
 			op := &Operation{}

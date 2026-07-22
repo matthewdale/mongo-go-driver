@@ -1,9 +1,10 @@
-go 1.26.0
+go 1.26.4
 
 use (
 	.
 	./examples
 	./ext/awsauth
+	./ext/otelplugin
 	./internal/cmd/benchmark
 	./internal/cmd/check-fmt
 	./internal/cmd/faas/awslambda/mongodb

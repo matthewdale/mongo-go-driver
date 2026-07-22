@@ -29,6 +29,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/v2/telemetry"
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/auth"
@@ -73,6 +74,7 @@ type Client struct {
 	bsonOpts                  *options.BSONOptions
 	registry                  *bson.Registry
 	monitor                   *event.CommandMonitor
+	tracer                    telemetry.Tracer
 	serverAPI                 *driver.ServerAPIOptions
 	serverMonitor             *event.ServerMonitor
 	sessionPool               *session.Pool
@@ -161,6 +163,12 @@ func newClient(opts ...*options.ClientOptions) (*Client, error) {
 	if clientOpts.ServerMonitor != nil {
 		client.serverMonitor = clientOpts.ServerMonitor
 	}
+	// Tracer. Normalize a nil Tracer to the no-op implementation so that the
+	// operation code can call methods on it without a nil check.
+	client.tracer = telemetry.Noop()
+	if clientOpts.Tracer != nil {
+		client.tracer = clientOpts.Tracer
+	}
 	// ReadConcern
 	client.readConcern = &readconcern.ReadConcern{}
 	if clientOpts.ReadConcern != nil {
@@ -235,7 +243,8 @@ func newClient(opts ...*options.ClientOptions) (*Client, error) {
 		client.AppendDriverInfo(*clientOpts.DriverInfo)
 	}
 
-	cfg, err := topology.NewAuthenticatorConfig(client.authenticator,
+	cfg, err := topology.NewAuthenticatorConfig(
+		client.authenticator,
 		topology.WithAuthConfigClock(client.clock),
 		topology.WithAuthConfigClientOptions(clientOpts),
 		topology.WithAuthConfigDriverInfo(client.currentDriverInfo),
@@ -654,7 +663,8 @@ func (c *Client) newMongoCrypt(opts *options.AutoEncryptionOptions) (*mongocrypt
 		str, ok := val.(string)
 		if !ok {
 			return nil, fmt.Errorf(
-				`expected AutoEncryption extra option "cryptSharedLibPath" to be a string, but is a %T`, val)
+				`expected AutoEncryption extra option "cryptSharedLibPath" to be a string, but is a %T`, val,
+			)
 		}
 		cryptSharedLibPath = str
 	}
@@ -693,7 +703,8 @@ func (c *Client) newMongoCrypt(opts *options.AutoEncryptionOptions) (*mongocrypt
 		b, ok := val.(bool)
 		if !ok {
 			return nil, fmt.Errorf(
-				`expected AutoEncryption extra option "cryptSharedLibRequired" to be a bool, but is a %T`, val)
+				`expected AutoEncryption extra option "cryptSharedLibRequired" to be a bool, but is a %T`, val,
+			)
 		}
 		cryptSharedLibRequired = b
 	}
@@ -703,7 +714,8 @@ func (c *Client) newMongoCrypt(opts *options.AutoEncryptionOptions) (*mongocrypt
 	// return an error indicating that we couldn't load the crypt_shared library.
 	if cryptSharedLibRequired && mc.CryptSharedLibVersionString() == "" {
 		return nil, errors.New(
-			`AutoEncryption extra option "cryptSharedLibRequired" is true, but we failed to load the crypt_shared library`)
+			`AutoEncryption extra option "cryptSharedLibRequired" is true, but we failed to load the crypt_shared library`,
+		)
 	}
 
 	return mc, nil

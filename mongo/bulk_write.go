@@ -193,6 +193,7 @@ func (bw *bulkWrite) runInsert(ctx context.Context, batch bulkWriteBatch) (inser
 		session:       bw.session,
 		writeConcern:  bw.writeConcern,
 		monitor:       bw.collection.client.monitor,
+		tracer:        bw.collection.client.tracer,
 		selector:      bw.selector,
 		clock:         bw.collection.client.clock,
 		database:      bw.collection.db.name,

@@ -316,6 +316,7 @@ func (coll *Collection) insert(
 		session:                   sess,
 		writeConcern:              wc,
 		monitor:                   coll.client.monitor,
+		tracer:                    coll.client.tracer,
 		maxAdaptiveRetries:        maxAdaptiveRetries,
 		enableOverloadRetargeting: coll.client.enableOverloadRetargeting,
 		selector:                  selector,

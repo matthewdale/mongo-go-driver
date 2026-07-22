@@ -17,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/internal/driverutil"
 	"go.mongodb.org/mongo-driver/v2/internal/logger"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/v2/telemetry"
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
@@ -34,6 +35,7 @@ type insertOp struct {
 	clock                     *session.ClusterClock
 	collection                string
 	monitor                   *event.CommandMonitor
+	tracer                    telemetry.Tracer
 	crypt                     driver.Crypt
 	database                  string
 	deployment                driver.Deployment
@@ -105,6 +107,7 @@ func (i *insertOp) execute(ctx context.Context) error {
 		Client:                    i.session,
 		Clock:                     i.clock,
 		CommandMonitor:            i.monitor,
+		Tracer:                    i.tracer,
 		Crypt:                     i.crypt,
 		Database:                  i.database,
 		Deployment:                i.deployment,

@@ -31,6 +31,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 	"go.mongodb.org/mongo-driver/v2/tag"
+	"go.mongodb.org/mongo-driver/v2/telemetry"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/auth"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/connstring"
@@ -291,6 +292,7 @@ type ClientOptions struct {
 	PoolMonitor              *event.PoolMonitor
 	Monitor                  *event.CommandMonitor
 	ServerMonitor            *event.ServerMonitor
+	Tracer                   telemetry.Tracer
 	ReadConcern              *readconcern.ReadConcern
 	ReadPreference           *readpref.ReadPref
 	BSONOptions              *BSONOptions
@@ -900,6 +902,24 @@ func (c *ClientOptions) SetMonitor(m *event.CommandMonitor) *ClientOptions {
 // SetServerMonitor specifies an SDAM monitor used to monitor SDAM events.
 func (c *ClientOptions) SetServerMonitor(m *event.ServerMonitor) *ClientOptions {
 	c.ServerMonitor = m
+
+	return c
+}
+
+// SetTracer specifies a tracer used to create spans describing the work the
+// driver performs on behalf of an operation. Setting a nil Tracer disables
+// tracing.
+//
+// Note that, like the other options set by a Set method, a nil Tracer passed
+// here does not clear a Tracer that was set on an earlier ClientOptions in the
+// same [MergeClientOptions] call. Only a non-nil value overwrites a previous
+// one.
+//
+// Tracing is experimental. The telemetry package's API is unstable and is not
+// covered by the driver's semantic-versioning guarantees. See the
+// [go.mongodb.org/mongo-driver/v2/telemetry] package documentation.
+func (c *ClientOptions) SetTracer(t telemetry.Tracer) *ClientOptions {
+	c.Tracer = t
 
 	return c
 }
