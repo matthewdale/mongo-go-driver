@@ -35,6 +35,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/auth"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/connstring"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/wiremessage"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -291,6 +292,7 @@ type ClientOptions struct {
 	PoolMonitor              *event.PoolMonitor
 	Monitor                  *event.CommandMonitor
 	ServerMonitor            *event.ServerMonitor
+	TracingOptions           *TracingOptions
 	ReadConcern              *readconcern.ReadConcern
 	ReadPreference           *readpref.ReadPref
 	BSONOptions              *BSONOptions
@@ -900,6 +902,27 @@ func (c *ClientOptions) SetMonitor(m *event.CommandMonitor) *ClientOptions {
 // SetServerMonitor specifies an SDAM monitor used to monitor SDAM events.
 func (c *ClientOptions) SetServerMonitor(m *event.ServerMonitor) *ClientOptions {
 	c.ServerMonitor = m
+
+	return c
+}
+
+// TracingOptions are options for enabling operation tracing.
+type TracingOptions struct {
+	// TracerProvider specifies the OpenTelemetry TracerProvider to use for
+	// tracing driver operations and the server commands they issue. The default
+	// is nil, meaning tracing is disabled.
+	TracerProvider trace.TracerProvider
+
+	// QueryTextMaxLength is the maximum length of the "db.query.text" attribute
+	// of command spans. The default is 0, which omits the "db.query.text"
+	// attribute.
+	QueryTextMaxLength int
+}
+
+// SetTracingOptions sets options for enabling operation tracing. The default is
+// nil, meaning tracing is disabled.
+func (c *ClientOptions) SetTracingOptions(opts *TracingOptions) *ClientOptions {
+	c.TracingOptions = opts
 
 	return c
 }

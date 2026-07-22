@@ -16,7 +16,9 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/internal/csfle"
+	"go.mongodb.org/mongo-driver/v2/internal/driverutil"
 	"go.mongodb.org/mongo-driver/v2/internal/mongoutil"
+	"go.mongodb.org/mongo-driver/v2/internal/observability"
 	"go.mongodb.org/mongo-driver/v2/internal/optionsutil"
 	"go.mongodb.org/mongo-driver/v2/internal/ptrutil"
 	"go.mongodb.org/mongo-driver/v2/internal/serverselector"
@@ -266,10 +268,26 @@ func (coll *Collection) insert(
 	ctx context.Context,
 	documents []any,
 	opts ...options.Lister[options.InsertManyOptions],
-) ([]any, error) {
+) (_ []any, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
+	// Start the operation span before any work, so that its duration covers
+	// document marshalling and server selection as well as the round trip. The
+	// span is placed on ctx, so the spans for the commands this operation issues
+	// nest underneath it.
+	ctx, span := coll.client.observer.OperationStarted(ctx, observability.OperationInfo{
+		Name:           driverutil.InsertOp,
+		DatabaseName:   coll.db.name,
+		CollectionName: coll.name,
+	})
+	defer func() {
+		// insert has many error returns, including the write-error path below,
+		// so record from the named return rather than at each one.
+		observability.RecordError(span, err, "")
+		span.End()
+	}()
 
 	result := make([]any, len(documents))
 	docs := make([]bsoncore.Document, len(documents))
@@ -294,7 +312,7 @@ func (coll *Collection) insert(
 		defer sess.EndSession()
 	}
 
-	err := coll.client.validSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return nil, err
 	}
@@ -316,6 +334,7 @@ func (coll *Collection) insert(
 		session:                   sess,
 		writeConcern:              wc,
 		monitor:                   coll.client.monitor,
+		tracer:                    coll.client.tracer,
 		maxAdaptiveRetries:        maxAdaptiveRetries,
 		enableOverloadRetargeting: coll.client.enableOverloadRetargeting,
 		selector:                  selector,
